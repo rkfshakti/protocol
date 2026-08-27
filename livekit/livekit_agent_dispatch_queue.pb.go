@@ -622,14 +622,16 @@ type DispatchQueueConfig struct {
 	// AgentDispatchService.CreateDispatch calls, anything not from this queue -
 	// draws on the same capacity, and this is what the queue leaves for it.
 	//
-	// The queue is already adaptive: admission reads capacity REMAINING, so
-	// other work lowers what the queue may take with no configuration at all.
-	// This is the fixed margin on top of that, covering arrivals between one
-	// admission round and the next, before the queue has recomputed.
+	// The asymmetry is the point: a queued job that cannot get capacity waits,
+	// which is what the queue is for. A request from anywhere else has nowhere
+	// to wait - it fails with quota exceeded. So the queue must never take the
+	// project's last capacity, however much it still has to drain.
 	//
-	// Size it as arrivals per second times a few seconds, NOT as the peak
-	// concurrency of that other work. A project starting 5 sessions/sec wants
-	// roughly 10-20 here even if it runs 500 at once.
+	// Size it to the demand you cannot afford to reject, NOT to the peak
+	// concurrency of that other work - admission already reads capacity
+	// REMAINING, so steady-state load lowers what the queue may take on its
+	// own. A project starting 5 sessions/sec wants roughly 10-20 here even if
+	// it runs 500 at once.
 	MinFreeCapacity uint32           `protobuf:"varint,1,opt,name=min_free_capacity,json=minFreeCapacity,proto3" json:"min_free_capacity,omitempty"`
 	Limits          []*DispatchLimit `protobuf:"bytes,2,rep,name=limits,proto3" json:"limits,omitempty"`
 	unknownFields   protoimpl.UnknownFields
