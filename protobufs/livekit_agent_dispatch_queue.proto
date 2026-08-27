@@ -96,14 +96,6 @@ message QueuedJobInput {
   // webhooks. Project-level webhooks fire regardless.
   repeated WebhookConfig webhooks = 9;
 
-  // Classification labels, used to scope DispatchLimits. Not forwarded to the
-  // agent - use attributes for that.
-  //
-  // Values must name a class, never an identity: "insurer":"acme-health" is
-  // right, a phone number is not. Identities make the label set grow with the
-  // job set and put PII in a configuration surface.
-  map<string, string> labels = 10;
-
   // Hold the job until this time. A floor, not an appointment: the job still
   // waits on capacity once eligible, and eligibility only filters the FIFO
   // scan - order stays created_at, so a held job keeps its original place in
@@ -159,12 +151,11 @@ enum DispatchLimitScope {
   DISPATCH_LIMIT_SCOPE_UNSPECIFIED = 0;
   // QueuedJobInput.agent_name.
   DISPATCH_LIMIT_SCOPE_AGENT = 1;
-  // The QueuedJobInput.labels entry named by DispatchLimit.label.
-  DISPATCH_LIMIT_SCOPE_LABEL = 2;
 }
 
 // One limit over a slice of the project's queued traffic. A job is evaluated
 // against every limit it matches and the smallest remaining budget wins.
+// Per-group limits are set on the group instead, at AddJobsRequest.
 //
 // These bound what this queue admits. They do not bound sessions started
 // outside it, including direct AgentDispatchService.CreateDispatch calls, so
@@ -173,10 +164,8 @@ message DispatchLimit {
   DispatchLimitScope scope = 1;
   // Which value of the scoped attribute this limit covers. Empty with a scope
   // set means every distinct value gets its own budget of this size, so one
-  // rule can cover all agents or all label values without enumerating them.
+  // rule can cover all agents without enumerating them.
   string key = 2;
-  // SCOPE_LABEL only: which QueuedJobInput.labels key to slice on.
-  string label = 3;
 
   // Jobs from this scope running at once. Unset is unlimited; 0 blocks the
   // scope without touching its jobs.
