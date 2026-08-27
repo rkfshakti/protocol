@@ -106,6 +106,59 @@ func (QueuedJobStatus) EnumDescriptor() ([]byte, []int) {
 	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{0}
 }
 
+// Which slice of the project's queued traffic a DispatchLimit applies to.
+type DispatchLimitScope int32
+
+const (
+	// The project's whole queue.
+	DispatchLimitScope_DISPATCH_LIMIT_SCOPE_UNSPECIFIED DispatchLimitScope = 0
+	// QueuedJobInput.agent_name.
+	DispatchLimitScope_DISPATCH_LIMIT_SCOPE_AGENT DispatchLimitScope = 1
+	// The QueuedJobInput.labels entry named by DispatchLimit.label.
+	DispatchLimitScope_DISPATCH_LIMIT_SCOPE_LABEL DispatchLimitScope = 2
+)
+
+// Enum value maps for DispatchLimitScope.
+var (
+	DispatchLimitScope_name = map[int32]string{
+		0: "DISPATCH_LIMIT_SCOPE_UNSPECIFIED",
+		1: "DISPATCH_LIMIT_SCOPE_AGENT",
+		2: "DISPATCH_LIMIT_SCOPE_LABEL",
+	}
+	DispatchLimitScope_value = map[string]int32{
+		"DISPATCH_LIMIT_SCOPE_UNSPECIFIED": 0,
+		"DISPATCH_LIMIT_SCOPE_AGENT":       1,
+		"DISPATCH_LIMIT_SCOPE_LABEL":       2,
+	}
+)
+
+func (x DispatchLimitScope) Enum() *DispatchLimitScope {
+	p := new(DispatchLimitScope)
+	*p = x
+	return p
+}
+
+func (x DispatchLimitScope) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (DispatchLimitScope) Descriptor() protoreflect.EnumDescriptor {
+	return file_livekit_agent_dispatch_queue_proto_enumTypes[1].Descriptor()
+}
+
+func (DispatchLimitScope) Type() protoreflect.EnumType {
+	return &file_livekit_agent_dispatch_queue_proto_enumTypes[1]
+}
+
+func (x DispatchLimitScope) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use DispatchLimitScope.Descriptor instead.
+func (DispatchLimitScope) EnumDescriptor() ([]byte, []int) {
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{1}
+}
+
 // What to dispatch. Mirrors CreateAgentDispatchRequest so that a queued job and
 // an immediate dispatch describe the same work.
 type QueuedJobInput struct {
@@ -127,7 +180,14 @@ type QueuedJobInput struct {
 	ExpiresAt *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=expires_at,json=expiresAt,proto3,oneof" json:"expires_at,omitempty"`
 	// Per-job callbacks, signed with the project key, as with Egress per-request
 	// webhooks. Project-level webhooks fire regardless.
-	Webhooks      []*WebhookConfig `protobuf:"bytes,9,rep,name=webhooks,proto3" json:"webhooks,omitempty"`
+	Webhooks []*WebhookConfig `protobuf:"bytes,9,rep,name=webhooks,proto3" json:"webhooks,omitempty"`
+	// Classification labels, used to scope DispatchLimits. Not forwarded to the
+	// agent - use attributes for that.
+	//
+	// Values must name a class, never an identity: "insurer":"acme-health" is
+	// right, a phone number is not. Identities make the label set grow with the
+	// campaign and put PII in a configuration surface.
+	Labels        map[string]string `protobuf:"bytes,10,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -221,6 +281,13 @@ func (x *QueuedJobInput) GetExpiresAt() *timestamppb.Timestamp {
 func (x *QueuedJobInput) GetWebhooks() []*WebhookConfig {
 	if x != nil {
 		return x.Webhooks
+	}
+	return nil
+}
+
+func (x *QueuedJobInput) GetLabels() map[string]string {
+	if x != nil {
+		return x.Labels
 	}
 	return nil
 }
@@ -368,11 +435,14 @@ type JobGroup struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Id    string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
 	// A paused group admits nothing; jobs already in flight run to completion.
-	Paused        bool                    `protobuf:"varint,2,opt,name=paused,proto3" json:"paused,omitempty"`
-	CreatedAt     *timestamppb.Timestamp  `protobuf:"bytes,3,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
-	Counts        []*JobGroup_StatusCount `protobuf:"bytes,4,rep,name=counts,proto3" json:"counts,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Paused    bool                    `protobuf:"varint,2,opt,name=paused,proto3" json:"paused,omitempty"`
+	CreatedAt *timestamppb.Timestamp  `protobuf:"bytes,3,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	Counts    []*JobGroup_StatusCount `protobuf:"bytes,4,rep,name=counts,proto3" json:"counts,omitempty"`
+	// Jobs from this group running at once, as set when the group was created.
+	// Zero means the dispatcher default applies.
+	ConcurrencyLimit uint32 `protobuf:"varint,5,opt,name=concurrency_limit,json=concurrencyLimit,proto3" json:"concurrency_limit,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *JobGroup) Reset() {
@@ -433,18 +503,126 @@ func (x *JobGroup) GetCounts() []*JobGroup_StatusCount {
 	return nil
 }
 
+func (x *JobGroup) GetConcurrencyLimit() uint32 {
+	if x != nil {
+		return x.ConcurrencyLimit
+	}
+	return 0
+}
+
+// One limit over a slice of the project's queued traffic. A job is evaluated
+// against every limit it matches and the smallest remaining budget wins.
+//
+// These bound what this queue admits. They do not bound inbound sessions or
+// direct AgentDispatchService.CreateDispatch calls, so they are not a cap on
+// an agent's total concurrency.
+type DispatchLimit struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Scope DispatchLimitScope     `protobuf:"varint,1,opt,name=scope,proto3,enum=livekit.DispatchLimitScope" json:"scope,omitempty"`
+	// Which value of the scoped attribute this limit covers. Empty with a scope
+	// set means every distinct value gets its own budget of this size, so one
+	// rule can cover all agents or all label values without enumerating them.
+	Key string `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
+	// SCOPE_LABEL only: which QueuedJobInput.labels key to slice on.
+	Label string `protobuf:"bytes,3,opt,name=label,proto3" json:"label,omitempty"`
+	// Jobs from this scope running at once. Unset is unlimited; 0 blocks the
+	// scope without touching its jobs.
+	MaxConcurrent *uint32 `protobuf:"varint,4,opt,name=max_concurrent,json=maxConcurrent,proto3,oneof" json:"max_concurrent,omitempty"`
+	// Dispatch starts allowed in any rolling 60 seconds - not calendar minutes.
+	// The scheduler releases this budget in slices across admission rounds, so a
+	// minute's worth never lands at once. Unset is unrated.
+	MaxStartsPerMinute *uint32 `protobuf:"varint,5,opt,name=max_starts_per_minute,json=maxStartsPerMinute,proto3,oneof" json:"max_starts_per_minute,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *DispatchLimit) Reset() {
+	*x = DispatchLimit{}
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DispatchLimit) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DispatchLimit) ProtoMessage() {}
+
+func (x *DispatchLimit) ProtoReflect() protoreflect.Message {
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DispatchLimit.ProtoReflect.Descriptor instead.
+func (*DispatchLimit) Descriptor() ([]byte, []int) {
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *DispatchLimit) GetScope() DispatchLimitScope {
+	if x != nil {
+		return x.Scope
+	}
+	return DispatchLimitScope_DISPATCH_LIMIT_SCOPE_UNSPECIFIED
+}
+
+func (x *DispatchLimit) GetKey() string {
+	if x != nil {
+		return x.Key
+	}
+	return ""
+}
+
+func (x *DispatchLimit) GetLabel() string {
+	if x != nil {
+		return x.Label
+	}
+	return ""
+}
+
+func (x *DispatchLimit) GetMaxConcurrent() uint32 {
+	if x != nil && x.MaxConcurrent != nil {
+		return *x.MaxConcurrent
+	}
+	return 0
+}
+
+func (x *DispatchLimit) GetMaxStartsPerMinute() uint32 {
+	if x != nil && x.MaxStartsPerMinute != nil {
+		return *x.MaxStartsPerMinute
+	}
+	return 0
+}
+
 type DispatchQueueConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Concurrency the project holds back for inbound sessions. Outbound
-	// admission is capped at the project's remaining reservations minus this.
-	ReservedInboundConcurrency uint32 `protobuf:"varint,1,opt,name=reserved_inbound_concurrency,json=reservedInboundConcurrency,proto3" json:"reserved_inbound_concurrency,omitempty"`
-	unknownFields              protoimpl.UnknownFields
-	sizeCache                  protoimpl.SizeCache
+	// How far below the project's capacity outbound admission stops.
+	//
+	// Outbound is already adaptive: admission is computed from capacity
+	// REMAINING, so every inbound session lowers what outbound may take with no
+	// configuration at all. This setting is not that adaptation. It is the fixed
+	// margin on top of it, covering sessions that arrive between one admission
+	// round and the next, before outbound has recomputed.
+	//
+	// Size it as arrivals per second times a few seconds, NOT as peak inbound
+	// concurrency. A project taking 5 inbound calls/sec wants roughly 10-20 here
+	// even if it runs 500 inbound calls at once.
+	OutboundHeadroom uint32           `protobuf:"varint,1,opt,name=outbound_headroom,json=outboundHeadroom,proto3" json:"outbound_headroom,omitempty"`
+	Limits           []*DispatchLimit `protobuf:"bytes,2,rep,name=limits,proto3" json:"limits,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *DispatchQueueConfig) Reset() {
 	*x = DispatchQueueConfig{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[3]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -456,7 +634,7 @@ func (x *DispatchQueueConfig) String() string {
 func (*DispatchQueueConfig) ProtoMessage() {}
 
 func (x *DispatchQueueConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[3]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -469,14 +647,21 @@ func (x *DispatchQueueConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DispatchQueueConfig.ProtoReflect.Descriptor instead.
 func (*DispatchQueueConfig) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{3}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{4}
 }
 
-func (x *DispatchQueueConfig) GetReservedInboundConcurrency() uint32 {
+func (x *DispatchQueueConfig) GetOutboundHeadroom() uint32 {
 	if x != nil {
-		return x.ReservedInboundConcurrency
+		return x.OutboundHeadroom
 	}
 	return 0
+}
+
+func (x *DispatchQueueConfig) GetLimits() []*DispatchLimit {
+	if x != nil {
+		return x.Limits
+	}
+	return nil
 }
 
 type AddJobsRequest struct {
@@ -484,14 +669,19 @@ type AddJobsRequest struct {
 	// Up to 1,000 per request; clients loop for larger campaigns.
 	Jobs []*QueuedJobInput `protobuf:"bytes,1,rep,name=jobs,proto3" json:"jobs,omitempty"`
 	// Attach every job in this request to a group, created on first use.
-	GroupId       *string `protobuf:"bytes,2,opt,name=group_id,json=groupId,proto3,oneof" json:"group_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	GroupId *string `protobuf:"bytes,2,opt,name=group_id,json=groupId,proto3,oneof" json:"group_id,omitempty"`
+	// Jobs from this group to run at once. Applied when the group is created and
+	// ignored on later adds to the same group. Unset uses the dispatcher
+	// default. Group limits live here rather than in DispatchQueueConfig because
+	// groups are per-campaign and would otherwise churn the project config.
+	GroupConcurrencyLimit *uint32 `protobuf:"varint,3,opt,name=group_concurrency_limit,json=groupConcurrencyLimit,proto3,oneof" json:"group_concurrency_limit,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *AddJobsRequest) Reset() {
 	*x = AddJobsRequest{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[4]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -503,7 +693,7 @@ func (x *AddJobsRequest) String() string {
 func (*AddJobsRequest) ProtoMessage() {}
 
 func (x *AddJobsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[4]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -516,7 +706,7 @@ func (x *AddJobsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AddJobsRequest.ProtoReflect.Descriptor instead.
 func (*AddJobsRequest) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{4}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *AddJobsRequest) GetJobs() []*QueuedJobInput {
@@ -533,6 +723,13 @@ func (x *AddJobsRequest) GetGroupId() string {
 	return ""
 }
 
+func (x *AddJobsRequest) GetGroupConcurrencyLimit() uint32 {
+	if x != nil && x.GroupConcurrencyLimit != nil {
+		return *x.GroupConcurrencyLimit
+	}
+	return 0
+}
+
 type AddJobsResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Same order and length as the request. Validation is atomic: if any input
@@ -546,7 +743,7 @@ type AddJobsResponse struct {
 
 func (x *AddJobsResponse) Reset() {
 	*x = AddJobsResponse{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[5]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -558,7 +755,7 @@ func (x *AddJobsResponse) String() string {
 func (*AddJobsResponse) ProtoMessage() {}
 
 func (x *AddJobsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[5]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -571,7 +768,7 @@ func (x *AddJobsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AddJobsResponse.ProtoReflect.Descriptor instead.
 func (*AddJobsResponse) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{5}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *AddJobsResponse) GetJobs() []*QueuedJob {
@@ -590,7 +787,7 @@ type GetJobRequest struct {
 
 func (x *GetJobRequest) Reset() {
 	*x = GetJobRequest{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[6]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -602,7 +799,7 @@ func (x *GetJobRequest) String() string {
 func (*GetJobRequest) ProtoMessage() {}
 
 func (x *GetJobRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[6]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -615,7 +812,7 @@ func (x *GetJobRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetJobRequest.ProtoReflect.Descriptor instead.
 func (*GetJobRequest) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{6}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *GetJobRequest) GetJobId() string {
@@ -634,7 +831,7 @@ type GetJobResponse struct {
 
 func (x *GetJobResponse) Reset() {
 	*x = GetJobResponse{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[7]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -646,7 +843,7 @@ func (x *GetJobResponse) String() string {
 func (*GetJobResponse) ProtoMessage() {}
 
 func (x *GetJobResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[7]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -659,7 +856,7 @@ func (x *GetJobResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetJobResponse.ProtoReflect.Descriptor instead.
 func (*GetJobResponse) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{7}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *GetJobResponse) GetJob() *QueuedJob {
@@ -681,7 +878,7 @@ type ListJobsRequest struct {
 
 func (x *ListJobsRequest) Reset() {
 	*x = ListJobsRequest{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[8]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -693,7 +890,7 @@ func (x *ListJobsRequest) String() string {
 func (*ListJobsRequest) ProtoMessage() {}
 
 func (x *ListJobsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[8]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -706,7 +903,7 @@ func (x *ListJobsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListJobsRequest.ProtoReflect.Descriptor instead.
 func (*ListJobsRequest) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{8}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ListJobsRequest) GetGroupId() string {
@@ -747,7 +944,7 @@ type ListJobsResponse struct {
 
 func (x *ListJobsResponse) Reset() {
 	*x = ListJobsResponse{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[9]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -759,7 +956,7 @@ func (x *ListJobsResponse) String() string {
 func (*ListJobsResponse) ProtoMessage() {}
 
 func (x *ListJobsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[9]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -772,7 +969,7 @@ func (x *ListJobsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListJobsResponse.ProtoReflect.Descriptor instead.
 func (*ListJobsResponse) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{9}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ListJobsResponse) GetJobs() []*QueuedJob {
@@ -801,7 +998,7 @@ type RemoveJobRequest struct {
 
 func (x *RemoveJobRequest) Reset() {
 	*x = RemoveJobRequest{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[10]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -813,7 +1010,7 @@ func (x *RemoveJobRequest) String() string {
 func (*RemoveJobRequest) ProtoMessage() {}
 
 func (x *RemoveJobRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[10]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -826,7 +1023,7 @@ func (x *RemoveJobRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveJobRequest.ProtoReflect.Descriptor instead.
 func (*RemoveJobRequest) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{10}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *RemoveJobRequest) GetJobId() string {
@@ -844,7 +1041,7 @@ type RemoveJobResponse struct {
 
 func (x *RemoveJobResponse) Reset() {
 	*x = RemoveJobResponse{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[11]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -856,7 +1053,7 @@ func (x *RemoveJobResponse) String() string {
 func (*RemoveJobResponse) ProtoMessage() {}
 
 func (x *RemoveJobResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[11]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -869,7 +1066,7 @@ func (x *RemoveJobResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveJobResponse.ProtoReflect.Descriptor instead.
 func (*RemoveJobResponse) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{11}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{12}
 }
 
 // Re-queues jobs in a FAILED or EXPIRED state, reusing their rows and
@@ -886,7 +1083,7 @@ type RetryJobsRequest struct {
 
 func (x *RetryJobsRequest) Reset() {
 	*x = RetryJobsRequest{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[12]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -898,7 +1095,7 @@ func (x *RetryJobsRequest) String() string {
 func (*RetryJobsRequest) ProtoMessage() {}
 
 func (x *RetryJobsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[12]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -911,7 +1108,7 @@ func (x *RetryJobsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RetryJobsRequest.ProtoReflect.Descriptor instead.
 func (*RetryJobsRequest) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{12}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *RetryJobsRequest) GetJobIds() []string {
@@ -937,7 +1134,7 @@ type RetryJobsResponse struct {
 
 func (x *RetryJobsResponse) Reset() {
 	*x = RetryJobsResponse{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[13]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -949,7 +1146,7 @@ func (x *RetryJobsResponse) String() string {
 func (*RetryJobsResponse) ProtoMessage() {}
 
 func (x *RetryJobsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[13]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -962,7 +1159,7 @@ func (x *RetryJobsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RetryJobsResponse.ProtoReflect.Descriptor instead.
 func (*RetryJobsResponse) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{13}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *RetryJobsResponse) GetJobs() []*QueuedJob {
@@ -980,7 +1177,7 @@ type ListJobGroupsRequest struct {
 
 func (x *ListJobGroupsRequest) Reset() {
 	*x = ListJobGroupsRequest{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[14]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -992,7 +1189,7 @@ func (x *ListJobGroupsRequest) String() string {
 func (*ListJobGroupsRequest) ProtoMessage() {}
 
 func (x *ListJobGroupsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[14]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1005,7 +1202,7 @@ func (x *ListJobGroupsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListJobGroupsRequest.ProtoReflect.Descriptor instead.
 func (*ListJobGroupsRequest) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{14}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{15}
 }
 
 type ListJobGroupsResponse struct {
@@ -1017,7 +1214,7 @@ type ListJobGroupsResponse struct {
 
 func (x *ListJobGroupsResponse) Reset() {
 	*x = ListJobGroupsResponse{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[15]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1029,7 +1226,7 @@ func (x *ListJobGroupsResponse) String() string {
 func (*ListJobGroupsResponse) ProtoMessage() {}
 
 func (x *ListJobGroupsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[15]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1042,7 +1239,7 @@ func (x *ListJobGroupsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListJobGroupsResponse.ProtoReflect.Descriptor instead.
 func (*ListJobGroupsResponse) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{15}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *ListJobGroupsResponse) GetGroups() []*JobGroup {
@@ -1063,7 +1260,7 @@ type PauseJobGroupRequest struct {
 
 func (x *PauseJobGroupRequest) Reset() {
 	*x = PauseJobGroupRequest{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[16]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1075,7 +1272,7 @@ func (x *PauseJobGroupRequest) String() string {
 func (*PauseJobGroupRequest) ProtoMessage() {}
 
 func (x *PauseJobGroupRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[16]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1088,7 +1285,7 @@ func (x *PauseJobGroupRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PauseJobGroupRequest.ProtoReflect.Descriptor instead.
 func (*PauseJobGroupRequest) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{16}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *PauseJobGroupRequest) GetGroupId() string {
@@ -1106,7 +1303,7 @@ type PauseJobGroupResponse struct {
 
 func (x *PauseJobGroupResponse) Reset() {
 	*x = PauseJobGroupResponse{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[17]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1118,7 +1315,7 @@ func (x *PauseJobGroupResponse) String() string {
 func (*PauseJobGroupResponse) ProtoMessage() {}
 
 func (x *PauseJobGroupResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[17]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1131,7 +1328,7 @@ func (x *PauseJobGroupResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PauseJobGroupResponse.ProtoReflect.Descriptor instead.
 func (*PauseJobGroupResponse) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{17}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{18}
 }
 
 type ResumeJobGroupRequest struct {
@@ -1143,7 +1340,7 @@ type ResumeJobGroupRequest struct {
 
 func (x *ResumeJobGroupRequest) Reset() {
 	*x = ResumeJobGroupRequest{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[18]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1155,7 +1352,7 @@ func (x *ResumeJobGroupRequest) String() string {
 func (*ResumeJobGroupRequest) ProtoMessage() {}
 
 func (x *ResumeJobGroupRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[18]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1168,7 +1365,7 @@ func (x *ResumeJobGroupRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResumeJobGroupRequest.ProtoReflect.Descriptor instead.
 func (*ResumeJobGroupRequest) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{18}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *ResumeJobGroupRequest) GetGroupId() string {
@@ -1186,7 +1383,7 @@ type ResumeJobGroupResponse struct {
 
 func (x *ResumeJobGroupResponse) Reset() {
 	*x = ResumeJobGroupResponse{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[19]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1198,7 +1395,7 @@ func (x *ResumeJobGroupResponse) String() string {
 func (*ResumeJobGroupResponse) ProtoMessage() {}
 
 func (x *ResumeJobGroupResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[19]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1211,7 +1408,7 @@ func (x *ResumeJobGroupResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResumeJobGroupResponse.ProtoReflect.Descriptor instead.
 func (*ResumeJobGroupResponse) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{19}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{20}
 }
 
 // Cancels the queued jobs in the group; jobs already in flight run to
@@ -1225,7 +1422,7 @@ type CancelJobGroupRequest struct {
 
 func (x *CancelJobGroupRequest) Reset() {
 	*x = CancelJobGroupRequest{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[20]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1237,7 +1434,7 @@ func (x *CancelJobGroupRequest) String() string {
 func (*CancelJobGroupRequest) ProtoMessage() {}
 
 func (x *CancelJobGroupRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[20]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1250,7 +1447,7 @@ func (x *CancelJobGroupRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelJobGroupRequest.ProtoReflect.Descriptor instead.
 func (*CancelJobGroupRequest) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{20}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *CancelJobGroupRequest) GetGroupId() string {
@@ -1268,7 +1465,7 @@ type CancelJobGroupResponse struct {
 
 func (x *CancelJobGroupResponse) Reset() {
 	*x = CancelJobGroupResponse{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[21]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1280,7 +1477,7 @@ func (x *CancelJobGroupResponse) String() string {
 func (*CancelJobGroupResponse) ProtoMessage() {}
 
 func (x *CancelJobGroupResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[21]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1293,7 +1490,7 @@ func (x *CancelJobGroupResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelJobGroupResponse.ProtoReflect.Descriptor instead.
 func (*CancelJobGroupResponse) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{21}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{22}
 }
 
 // Cancels the remaining queued jobs and hides the group and its terminal jobs
@@ -1307,7 +1504,7 @@ type DeleteJobGroupRequest struct {
 
 func (x *DeleteJobGroupRequest) Reset() {
 	*x = DeleteJobGroupRequest{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[22]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1319,7 +1516,7 @@ func (x *DeleteJobGroupRequest) String() string {
 func (*DeleteJobGroupRequest) ProtoMessage() {}
 
 func (x *DeleteJobGroupRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[22]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1332,7 +1529,7 @@ func (x *DeleteJobGroupRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteJobGroupRequest.ProtoReflect.Descriptor instead.
 func (*DeleteJobGroupRequest) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{22}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *DeleteJobGroupRequest) GetGroupId() string {
@@ -1350,7 +1547,7 @@ type DeleteJobGroupResponse struct {
 
 func (x *DeleteJobGroupResponse) Reset() {
 	*x = DeleteJobGroupResponse{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[23]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1362,7 +1559,7 @@ func (x *DeleteJobGroupResponse) String() string {
 func (*DeleteJobGroupResponse) ProtoMessage() {}
 
 func (x *DeleteJobGroupResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[23]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1375,7 +1572,7 @@ func (x *DeleteJobGroupResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteJobGroupResponse.ProtoReflect.Descriptor instead.
 func (*DeleteJobGroupResponse) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{23}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{24}
 }
 
 type GetDispatchQueueConfigRequest struct {
@@ -1386,7 +1583,7 @@ type GetDispatchQueueConfigRequest struct {
 
 func (x *GetDispatchQueueConfigRequest) Reset() {
 	*x = GetDispatchQueueConfigRequest{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[24]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1398,7 +1595,7 @@ func (x *GetDispatchQueueConfigRequest) String() string {
 func (*GetDispatchQueueConfigRequest) ProtoMessage() {}
 
 func (x *GetDispatchQueueConfigRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[24]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1411,7 +1608,7 @@ func (x *GetDispatchQueueConfigRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetDispatchQueueConfigRequest.ProtoReflect.Descriptor instead.
 func (*GetDispatchQueueConfigRequest) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{24}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{25}
 }
 
 type GetDispatchQueueConfigResponse struct {
@@ -1423,7 +1620,7 @@ type GetDispatchQueueConfigResponse struct {
 
 func (x *GetDispatchQueueConfigResponse) Reset() {
 	*x = GetDispatchQueueConfigResponse{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[25]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1435,7 +1632,7 @@ func (x *GetDispatchQueueConfigResponse) String() string {
 func (*GetDispatchQueueConfigResponse) ProtoMessage() {}
 
 func (x *GetDispatchQueueConfigResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[25]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1448,7 +1645,7 @@ func (x *GetDispatchQueueConfigResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetDispatchQueueConfigResponse.ProtoReflect.Descriptor instead.
 func (*GetDispatchQueueConfigResponse) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{25}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *GetDispatchQueueConfigResponse) GetConfig() *DispatchQueueConfig {
@@ -1458,16 +1655,18 @@ func (x *GetDispatchQueueConfigResponse) GetConfig() *DispatchQueueConfig {
 	return nil
 }
 
+// Replaces the stored config wholesale, so an omitted limit is a removed
+// limit. Read-modify-write to change one field.
 type UpdateDispatchQueueConfigRequest struct {
-	state                      protoimpl.MessageState `protogen:"open.v1"`
-	ReservedInboundConcurrency uint32                 `protobuf:"varint,1,opt,name=reserved_inbound_concurrency,json=reservedInboundConcurrency,proto3" json:"reserved_inbound_concurrency,omitempty"`
-	unknownFields              protoimpl.UnknownFields
-	sizeCache                  protoimpl.SizeCache
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Config        *DispatchQueueConfig   `protobuf:"bytes,1,opt,name=config,proto3" json:"config,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *UpdateDispatchQueueConfigRequest) Reset() {
 	*x = UpdateDispatchQueueConfigRequest{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[26]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1479,7 +1678,7 @@ func (x *UpdateDispatchQueueConfigRequest) String() string {
 func (*UpdateDispatchQueueConfigRequest) ProtoMessage() {}
 
 func (x *UpdateDispatchQueueConfigRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[26]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1492,14 +1691,14 @@ func (x *UpdateDispatchQueueConfigRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateDispatchQueueConfigRequest.ProtoReflect.Descriptor instead.
 func (*UpdateDispatchQueueConfigRequest) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{26}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{27}
 }
 
-func (x *UpdateDispatchQueueConfigRequest) GetReservedInboundConcurrency() uint32 {
+func (x *UpdateDispatchQueueConfigRequest) GetConfig() *DispatchQueueConfig {
 	if x != nil {
-		return x.ReservedInboundConcurrency
+		return x.Config
 	}
-	return 0
+	return nil
 }
 
 type UpdateDispatchQueueConfigResponse struct {
@@ -1511,7 +1710,7 @@ type UpdateDispatchQueueConfigResponse struct {
 
 func (x *UpdateDispatchQueueConfigResponse) Reset() {
 	*x = UpdateDispatchQueueConfigResponse{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[27]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1523,7 +1722,7 @@ func (x *UpdateDispatchQueueConfigResponse) String() string {
 func (*UpdateDispatchQueueConfigResponse) ProtoMessage() {}
 
 func (x *UpdateDispatchQueueConfigResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[27]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1536,7 +1735,7 @@ func (x *UpdateDispatchQueueConfigResponse) ProtoReflect() protoreflect.Message 
 
 // Deprecated: Use UpdateDispatchQueueConfigResponse.ProtoReflect.Descriptor instead.
 func (*UpdateDispatchQueueConfigResponse) Descriptor() ([]byte, []int) {
-	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{27}
+	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *UpdateDispatchQueueConfigResponse) GetConfig() *DispatchQueueConfig {
@@ -1557,7 +1756,7 @@ type JobGroup_StatusCount struct {
 
 func (x *JobGroup_StatusCount) Reset() {
 	*x = JobGroup_StatusCount{}
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[29]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1569,7 +1768,7 @@ func (x *JobGroup_StatusCount) String() string {
 func (*JobGroup_StatusCount) ProtoMessage() {}
 
 func (x *JobGroup_StatusCount) ProtoReflect() protoreflect.Message {
-	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[29]
+	mi := &file_livekit_agent_dispatch_queue_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1603,7 +1802,7 @@ var File_livekit_agent_dispatch_queue_proto protoreflect.FileDescriptor
 
 const file_livekit_agent_dispatch_queue_proto_rawDesc = "" +
 	"\n" +
-	"\"livekit_agent_dispatch_queue.proto\x12\alivekit\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1clivekit_agent_dispatch.proto\x1a\x14livekit_models.proto\x1a\x14logger/options.proto\"\x88\x04\n" +
+	"\"livekit_agent_dispatch_queue.proto\x12\alivekit\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1clivekit_agent_dispatch.proto\x1a\x14livekit_models.proto\x1a\x14logger/options.proto\"\x80\x05\n" +
 	"\x0eQueuedJobInput\x12\x1d\n" +
 	"\n" +
 	"agent_name\x18\x01 \x01(\tR\tagentName\x12\x1b\n" +
@@ -1619,8 +1818,13 @@ const file_livekit_agent_dispatch_queue_proto_rawDesc = "" +
 	"\x0erestart_policy\x18\a \x01(\x0e2\x19.livekit.JobRestartPolicyR\rrestartPolicy\x12>\n" +
 	"\n" +
 	"expires_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampH\x00R\texpiresAt\x88\x01\x01\x122\n" +
-	"\bwebhooks\x18\t \x03(\v2\x16.livekit.WebhookConfigR\bwebhooks\x1a=\n" +
+	"\bwebhooks\x18\t \x03(\v2\x16.livekit.WebhookConfigR\bwebhooks\x12;\n" +
+	"\x06labels\x18\n" +
+	" \x03(\v2#.livekit.QueuedJobInput.LabelsEntryR\x06labels\x1a=\n" +
 	"\x0fAttributesEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a9\n" +
+	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\r\n" +
 	"\v_expires_at\"\x9d\x04\n" +
@@ -1642,24 +1846,36 @@ const file_livekit_agent_dispatch_queue_proto_rawDesc = "" +
 	" \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x12?\n" +
 	"\rdispatched_at\x18\v \x01(\v2\x1a.google.protobuf.TimestampR\fdispatchedAt\x12=\n" +
 	"\fcompleted_at\x18\f \x01(\v2\x1a.google.protobuf.TimestampR\vcompletedAtB\v\n" +
-	"\t_group_id\"\x87\x02\n" +
+	"\t_group_id\"\xb4\x02\n" +
 	"\bJobGroup\x12\x1a\n" +
 	"\x02id\x18\x01 \x01(\tB\n" +
 	"\xbaP\agroupIDR\x02id\x12\x16\n" +
 	"\x06paused\x18\x02 \x01(\bR\x06paused\x129\n" +
 	"\n" +
 	"created_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x125\n" +
-	"\x06counts\x18\x04 \x03(\v2\x1d.livekit.JobGroup.StatusCountR\x06counts\x1aU\n" +
+	"\x06counts\x18\x04 \x03(\v2\x1d.livekit.JobGroup.StatusCountR\x06counts\x12+\n" +
+	"\x11concurrency_limit\x18\x05 \x01(\rR\x10concurrencyLimit\x1aU\n" +
 	"\vStatusCount\x120\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x18.livekit.QueuedJobStatusR\x06status\x12\x14\n" +
-	"\x05count\x18\x02 \x01(\rR\x05count\"W\n" +
-	"\x13DispatchQueueConfig\x12@\n" +
-	"\x1creserved_inbound_concurrency\x18\x01 \x01(\rR\x1areservedInboundConcurrency\"v\n" +
+	"\x05count\x18\x02 \x01(\rR\x05count\"\xfb\x01\n" +
+	"\rDispatchLimit\x121\n" +
+	"\x05scope\x18\x01 \x01(\x0e2\x1b.livekit.DispatchLimitScopeR\x05scope\x12\x10\n" +
+	"\x03key\x18\x02 \x01(\tR\x03key\x12\x14\n" +
+	"\x05label\x18\x03 \x01(\tR\x05label\x12*\n" +
+	"\x0emax_concurrent\x18\x04 \x01(\rH\x00R\rmaxConcurrent\x88\x01\x01\x126\n" +
+	"\x15max_starts_per_minute\x18\x05 \x01(\rH\x01R\x12maxStartsPerMinute\x88\x01\x01B\x11\n" +
+	"\x0f_max_concurrentB\x18\n" +
+	"\x16_max_starts_per_minute\"r\n" +
+	"\x13DispatchQueueConfig\x12+\n" +
+	"\x11outbound_headroom\x18\x01 \x01(\rR\x10outboundHeadroom\x12.\n" +
+	"\x06limits\x18\x02 \x03(\v2\x16.livekit.DispatchLimitR\x06limits\"\xcf\x01\n" +
 	"\x0eAddJobsRequest\x12+\n" +
 	"\x04jobs\x18\x01 \x03(\v2\x17.livekit.QueuedJobInputR\x04jobs\x12*\n" +
 	"\bgroup_id\x18\x02 \x01(\tB\n" +
-	"\xbaP\agroupIDH\x00R\agroupId\x88\x01\x01B\v\n" +
-	"\t_group_id\"9\n" +
+	"\xbaP\agroupIDH\x00R\agroupId\x88\x01\x01\x12;\n" +
+	"\x17group_concurrency_limit\x18\x03 \x01(\rH\x01R\x15groupConcurrencyLimit\x88\x01\x01B\v\n" +
+	"\t_group_idB\x1a\n" +
+	"\x18_group_concurrency_limit\"9\n" +
 	"\x0fAddJobsResponse\x12&\n" +
 	"\x04jobs\x18\x01 \x03(\v2\x12.livekit.QueuedJobR\x04jobs\"0\n" +
 	"\rGetJobRequest\x12\x1f\n" +
@@ -1716,9 +1932,9 @@ const file_livekit_agent_dispatch_queue_proto_rawDesc = "" +
 	"\x16DeleteJobGroupResponse\"\x1f\n" +
 	"\x1dGetDispatchQueueConfigRequest\"V\n" +
 	"\x1eGetDispatchQueueConfigResponse\x124\n" +
-	"\x06config\x18\x01 \x01(\v2\x1c.livekit.DispatchQueueConfigR\x06config\"d\n" +
-	" UpdateDispatchQueueConfigRequest\x12@\n" +
-	"\x1creserved_inbound_concurrency\x18\x01 \x01(\rR\x1areservedInboundConcurrency\"Y\n" +
+	"\x06config\x18\x01 \x01(\v2\x1c.livekit.DispatchQueueConfigR\x06config\"X\n" +
+	" UpdateDispatchQueueConfigRequest\x124\n" +
+	"\x06config\x18\x01 \x01(\v2\x1c.livekit.DispatchQueueConfigR\x06config\"Y\n" +
 	"!UpdateDispatchQueueConfigResponse\x124\n" +
 	"\x06config\x18\x01 \x01(\v2\x1c.livekit.DispatchQueueConfigR\x06config*\x93\x02\n" +
 	"\x0fQueuedJobStatus\x12!\n" +
@@ -1729,7 +1945,11 @@ const file_livekit_agent_dispatch_queue_proto_rawDesc = "" +
 	"\x1bQUEUED_JOB_STATUS_SUCCEEDED\x10\x04\x12\x1c\n" +
 	"\x18QUEUED_JOB_STATUS_FAILED\x10\x05\x12\x1f\n" +
 	"\x1bQUEUED_JOB_STATUS_CANCELLED\x10\x06\x12\x1d\n" +
-	"\x19QUEUED_JOB_STATUS_EXPIRED\x10\a2\xce\a\n" +
+	"\x19QUEUED_JOB_STATUS_EXPIRED\x10\a*z\n" +
+	"\x12DispatchLimitScope\x12$\n" +
+	" DISPATCH_LIMIT_SCOPE_UNSPECIFIED\x10\x00\x12\x1e\n" +
+	"\x1aDISPATCH_LIMIT_SCOPE_AGENT\x10\x01\x12\x1e\n" +
+	"\x1aDISPATCH_LIMIT_SCOPE_LABEL\x10\x022\xce\a\n" +
 	"\x12AgentDispatchQueue\x12<\n" +
 	"\aAddJobs\x12\x17.livekit.AddJobsRequest\x1a\x18.livekit.AddJobsResponse\x129\n" +
 	"\x06GetJob\x12\x16.livekit.GetJobRequest\x1a\x17.livekit.GetJobResponse\x12?\n" +
@@ -1756,99 +1976,106 @@ func file_livekit_agent_dispatch_queue_proto_rawDescGZIP() []byte {
 	return file_livekit_agent_dispatch_queue_proto_rawDescData
 }
 
-var file_livekit_agent_dispatch_queue_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_livekit_agent_dispatch_queue_proto_msgTypes = make([]protoimpl.MessageInfo, 30)
+var file_livekit_agent_dispatch_queue_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_livekit_agent_dispatch_queue_proto_msgTypes = make([]protoimpl.MessageInfo, 32)
 var file_livekit_agent_dispatch_queue_proto_goTypes = []any{
 	(QueuedJobStatus)(0),                      // 0: livekit.QueuedJobStatus
-	(*QueuedJobInput)(nil),                    // 1: livekit.QueuedJobInput
-	(*QueuedJob)(nil),                         // 2: livekit.QueuedJob
-	(*JobGroup)(nil),                          // 3: livekit.JobGroup
-	(*DispatchQueueConfig)(nil),               // 4: livekit.DispatchQueueConfig
-	(*AddJobsRequest)(nil),                    // 5: livekit.AddJobsRequest
-	(*AddJobsResponse)(nil),                   // 6: livekit.AddJobsResponse
-	(*GetJobRequest)(nil),                     // 7: livekit.GetJobRequest
-	(*GetJobResponse)(nil),                    // 8: livekit.GetJobResponse
-	(*ListJobsRequest)(nil),                   // 9: livekit.ListJobsRequest
-	(*ListJobsResponse)(nil),                  // 10: livekit.ListJobsResponse
-	(*RemoveJobRequest)(nil),                  // 11: livekit.RemoveJobRequest
-	(*RemoveJobResponse)(nil),                 // 12: livekit.RemoveJobResponse
-	(*RetryJobsRequest)(nil),                  // 13: livekit.RetryJobsRequest
-	(*RetryJobsResponse)(nil),                 // 14: livekit.RetryJobsResponse
-	(*ListJobGroupsRequest)(nil),              // 15: livekit.ListJobGroupsRequest
-	(*ListJobGroupsResponse)(nil),             // 16: livekit.ListJobGroupsResponse
-	(*PauseJobGroupRequest)(nil),              // 17: livekit.PauseJobGroupRequest
-	(*PauseJobGroupResponse)(nil),             // 18: livekit.PauseJobGroupResponse
-	(*ResumeJobGroupRequest)(nil),             // 19: livekit.ResumeJobGroupRequest
-	(*ResumeJobGroupResponse)(nil),            // 20: livekit.ResumeJobGroupResponse
-	(*CancelJobGroupRequest)(nil),             // 21: livekit.CancelJobGroupRequest
-	(*CancelJobGroupResponse)(nil),            // 22: livekit.CancelJobGroupResponse
-	(*DeleteJobGroupRequest)(nil),             // 23: livekit.DeleteJobGroupRequest
-	(*DeleteJobGroupResponse)(nil),            // 24: livekit.DeleteJobGroupResponse
-	(*GetDispatchQueueConfigRequest)(nil),     // 25: livekit.GetDispatchQueueConfigRequest
-	(*GetDispatchQueueConfigResponse)(nil),    // 26: livekit.GetDispatchQueueConfigResponse
-	(*UpdateDispatchQueueConfigRequest)(nil),  // 27: livekit.UpdateDispatchQueueConfigRequest
-	(*UpdateDispatchQueueConfigResponse)(nil), // 28: livekit.UpdateDispatchQueueConfigResponse
-	nil,                           // 29: livekit.QueuedJobInput.AttributesEntry
-	(*JobGroup_StatusCount)(nil),  // 30: livekit.JobGroup.StatusCount
-	(JobRestartPolicy)(0),         // 31: livekit.JobRestartPolicy
-	(*timestamppb.Timestamp)(nil), // 32: google.protobuf.Timestamp
-	(*WebhookConfig)(nil),         // 33: livekit.WebhookConfig
-	(*TokenPagination)(nil),       // 34: livekit.TokenPagination
+	(DispatchLimitScope)(0),                   // 1: livekit.DispatchLimitScope
+	(*QueuedJobInput)(nil),                    // 2: livekit.QueuedJobInput
+	(*QueuedJob)(nil),                         // 3: livekit.QueuedJob
+	(*JobGroup)(nil),                          // 4: livekit.JobGroup
+	(*DispatchLimit)(nil),                     // 5: livekit.DispatchLimit
+	(*DispatchQueueConfig)(nil),               // 6: livekit.DispatchQueueConfig
+	(*AddJobsRequest)(nil),                    // 7: livekit.AddJobsRequest
+	(*AddJobsResponse)(nil),                   // 8: livekit.AddJobsResponse
+	(*GetJobRequest)(nil),                     // 9: livekit.GetJobRequest
+	(*GetJobResponse)(nil),                    // 10: livekit.GetJobResponse
+	(*ListJobsRequest)(nil),                   // 11: livekit.ListJobsRequest
+	(*ListJobsResponse)(nil),                  // 12: livekit.ListJobsResponse
+	(*RemoveJobRequest)(nil),                  // 13: livekit.RemoveJobRequest
+	(*RemoveJobResponse)(nil),                 // 14: livekit.RemoveJobResponse
+	(*RetryJobsRequest)(nil),                  // 15: livekit.RetryJobsRequest
+	(*RetryJobsResponse)(nil),                 // 16: livekit.RetryJobsResponse
+	(*ListJobGroupsRequest)(nil),              // 17: livekit.ListJobGroupsRequest
+	(*ListJobGroupsResponse)(nil),             // 18: livekit.ListJobGroupsResponse
+	(*PauseJobGroupRequest)(nil),              // 19: livekit.PauseJobGroupRequest
+	(*PauseJobGroupResponse)(nil),             // 20: livekit.PauseJobGroupResponse
+	(*ResumeJobGroupRequest)(nil),             // 21: livekit.ResumeJobGroupRequest
+	(*ResumeJobGroupResponse)(nil),            // 22: livekit.ResumeJobGroupResponse
+	(*CancelJobGroupRequest)(nil),             // 23: livekit.CancelJobGroupRequest
+	(*CancelJobGroupResponse)(nil),            // 24: livekit.CancelJobGroupResponse
+	(*DeleteJobGroupRequest)(nil),             // 25: livekit.DeleteJobGroupRequest
+	(*DeleteJobGroupResponse)(nil),            // 26: livekit.DeleteJobGroupResponse
+	(*GetDispatchQueueConfigRequest)(nil),     // 27: livekit.GetDispatchQueueConfigRequest
+	(*GetDispatchQueueConfigResponse)(nil),    // 28: livekit.GetDispatchQueueConfigResponse
+	(*UpdateDispatchQueueConfigRequest)(nil),  // 29: livekit.UpdateDispatchQueueConfigRequest
+	(*UpdateDispatchQueueConfigResponse)(nil), // 30: livekit.UpdateDispatchQueueConfigResponse
+	nil,                           // 31: livekit.QueuedJobInput.AttributesEntry
+	nil,                           // 32: livekit.QueuedJobInput.LabelsEntry
+	(*JobGroup_StatusCount)(nil),  // 33: livekit.JobGroup.StatusCount
+	(JobRestartPolicy)(0),         // 34: livekit.JobRestartPolicy
+	(*timestamppb.Timestamp)(nil), // 35: google.protobuf.Timestamp
+	(*WebhookConfig)(nil),         // 36: livekit.WebhookConfig
+	(*TokenPagination)(nil),       // 37: livekit.TokenPagination
 }
 var file_livekit_agent_dispatch_queue_proto_depIdxs = []int32{
-	29, // 0: livekit.QueuedJobInput.attributes:type_name -> livekit.QueuedJobInput.AttributesEntry
-	31, // 1: livekit.QueuedJobInput.restart_policy:type_name -> livekit.JobRestartPolicy
-	32, // 2: livekit.QueuedJobInput.expires_at:type_name -> google.protobuf.Timestamp
-	33, // 3: livekit.QueuedJobInput.webhooks:type_name -> livekit.WebhookConfig
-	0,  // 4: livekit.QueuedJob.status:type_name -> livekit.QueuedJobStatus
-	1,  // 5: livekit.QueuedJob.input:type_name -> livekit.QueuedJobInput
-	32, // 6: livekit.QueuedJob.created_at:type_name -> google.protobuf.Timestamp
-	32, // 7: livekit.QueuedJob.dispatched_at:type_name -> google.protobuf.Timestamp
-	32, // 8: livekit.QueuedJob.completed_at:type_name -> google.protobuf.Timestamp
-	32, // 9: livekit.JobGroup.created_at:type_name -> google.protobuf.Timestamp
-	30, // 10: livekit.JobGroup.counts:type_name -> livekit.JobGroup.StatusCount
-	1,  // 11: livekit.AddJobsRequest.jobs:type_name -> livekit.QueuedJobInput
-	2,  // 12: livekit.AddJobsResponse.jobs:type_name -> livekit.QueuedJob
-	2,  // 13: livekit.GetJobResponse.job:type_name -> livekit.QueuedJob
-	0,  // 14: livekit.ListJobsRequest.status:type_name -> livekit.QueuedJobStatus
-	34, // 15: livekit.ListJobsRequest.page_token:type_name -> livekit.TokenPagination
-	2,  // 16: livekit.ListJobsResponse.jobs:type_name -> livekit.QueuedJob
-	34, // 17: livekit.ListJobsResponse.next_page_token:type_name -> livekit.TokenPagination
-	32, // 18: livekit.RetryJobsRequest.expires_at:type_name -> google.protobuf.Timestamp
-	2,  // 19: livekit.RetryJobsResponse.jobs:type_name -> livekit.QueuedJob
-	3,  // 20: livekit.ListJobGroupsResponse.groups:type_name -> livekit.JobGroup
-	4,  // 21: livekit.GetDispatchQueueConfigResponse.config:type_name -> livekit.DispatchQueueConfig
-	4,  // 22: livekit.UpdateDispatchQueueConfigResponse.config:type_name -> livekit.DispatchQueueConfig
-	0,  // 23: livekit.JobGroup.StatusCount.status:type_name -> livekit.QueuedJobStatus
-	5,  // 24: livekit.AgentDispatchQueue.AddJobs:input_type -> livekit.AddJobsRequest
-	7,  // 25: livekit.AgentDispatchQueue.GetJob:input_type -> livekit.GetJobRequest
-	9,  // 26: livekit.AgentDispatchQueue.ListJobs:input_type -> livekit.ListJobsRequest
-	11, // 27: livekit.AgentDispatchQueue.RemoveJob:input_type -> livekit.RemoveJobRequest
-	13, // 28: livekit.AgentDispatchQueue.RetryJobs:input_type -> livekit.RetryJobsRequest
-	15, // 29: livekit.AgentDispatchQueue.ListJobGroups:input_type -> livekit.ListJobGroupsRequest
-	17, // 30: livekit.AgentDispatchQueue.PauseJobGroup:input_type -> livekit.PauseJobGroupRequest
-	19, // 31: livekit.AgentDispatchQueue.ResumeJobGroup:input_type -> livekit.ResumeJobGroupRequest
-	21, // 32: livekit.AgentDispatchQueue.CancelJobGroup:input_type -> livekit.CancelJobGroupRequest
-	23, // 33: livekit.AgentDispatchQueue.DeleteJobGroup:input_type -> livekit.DeleteJobGroupRequest
-	25, // 34: livekit.AgentDispatchQueue.GetDispatchQueueConfig:input_type -> livekit.GetDispatchQueueConfigRequest
-	27, // 35: livekit.AgentDispatchQueue.UpdateDispatchQueueConfig:input_type -> livekit.UpdateDispatchQueueConfigRequest
-	6,  // 36: livekit.AgentDispatchQueue.AddJobs:output_type -> livekit.AddJobsResponse
-	8,  // 37: livekit.AgentDispatchQueue.GetJob:output_type -> livekit.GetJobResponse
-	10, // 38: livekit.AgentDispatchQueue.ListJobs:output_type -> livekit.ListJobsResponse
-	12, // 39: livekit.AgentDispatchQueue.RemoveJob:output_type -> livekit.RemoveJobResponse
-	14, // 40: livekit.AgentDispatchQueue.RetryJobs:output_type -> livekit.RetryJobsResponse
-	16, // 41: livekit.AgentDispatchQueue.ListJobGroups:output_type -> livekit.ListJobGroupsResponse
-	18, // 42: livekit.AgentDispatchQueue.PauseJobGroup:output_type -> livekit.PauseJobGroupResponse
-	20, // 43: livekit.AgentDispatchQueue.ResumeJobGroup:output_type -> livekit.ResumeJobGroupResponse
-	22, // 44: livekit.AgentDispatchQueue.CancelJobGroup:output_type -> livekit.CancelJobGroupResponse
-	24, // 45: livekit.AgentDispatchQueue.DeleteJobGroup:output_type -> livekit.DeleteJobGroupResponse
-	26, // 46: livekit.AgentDispatchQueue.GetDispatchQueueConfig:output_type -> livekit.GetDispatchQueueConfigResponse
-	28, // 47: livekit.AgentDispatchQueue.UpdateDispatchQueueConfig:output_type -> livekit.UpdateDispatchQueueConfigResponse
-	36, // [36:48] is the sub-list for method output_type
-	24, // [24:36] is the sub-list for method input_type
-	24, // [24:24] is the sub-list for extension type_name
-	24, // [24:24] is the sub-list for extension extendee
-	0,  // [0:24] is the sub-list for field type_name
+	31, // 0: livekit.QueuedJobInput.attributes:type_name -> livekit.QueuedJobInput.AttributesEntry
+	34, // 1: livekit.QueuedJobInput.restart_policy:type_name -> livekit.JobRestartPolicy
+	35, // 2: livekit.QueuedJobInput.expires_at:type_name -> google.protobuf.Timestamp
+	36, // 3: livekit.QueuedJobInput.webhooks:type_name -> livekit.WebhookConfig
+	32, // 4: livekit.QueuedJobInput.labels:type_name -> livekit.QueuedJobInput.LabelsEntry
+	0,  // 5: livekit.QueuedJob.status:type_name -> livekit.QueuedJobStatus
+	2,  // 6: livekit.QueuedJob.input:type_name -> livekit.QueuedJobInput
+	35, // 7: livekit.QueuedJob.created_at:type_name -> google.protobuf.Timestamp
+	35, // 8: livekit.QueuedJob.dispatched_at:type_name -> google.protobuf.Timestamp
+	35, // 9: livekit.QueuedJob.completed_at:type_name -> google.protobuf.Timestamp
+	35, // 10: livekit.JobGroup.created_at:type_name -> google.protobuf.Timestamp
+	33, // 11: livekit.JobGroup.counts:type_name -> livekit.JobGroup.StatusCount
+	1,  // 12: livekit.DispatchLimit.scope:type_name -> livekit.DispatchLimitScope
+	5,  // 13: livekit.DispatchQueueConfig.limits:type_name -> livekit.DispatchLimit
+	2,  // 14: livekit.AddJobsRequest.jobs:type_name -> livekit.QueuedJobInput
+	3,  // 15: livekit.AddJobsResponse.jobs:type_name -> livekit.QueuedJob
+	3,  // 16: livekit.GetJobResponse.job:type_name -> livekit.QueuedJob
+	0,  // 17: livekit.ListJobsRequest.status:type_name -> livekit.QueuedJobStatus
+	37, // 18: livekit.ListJobsRequest.page_token:type_name -> livekit.TokenPagination
+	3,  // 19: livekit.ListJobsResponse.jobs:type_name -> livekit.QueuedJob
+	37, // 20: livekit.ListJobsResponse.next_page_token:type_name -> livekit.TokenPagination
+	35, // 21: livekit.RetryJobsRequest.expires_at:type_name -> google.protobuf.Timestamp
+	3,  // 22: livekit.RetryJobsResponse.jobs:type_name -> livekit.QueuedJob
+	4,  // 23: livekit.ListJobGroupsResponse.groups:type_name -> livekit.JobGroup
+	6,  // 24: livekit.GetDispatchQueueConfigResponse.config:type_name -> livekit.DispatchQueueConfig
+	6,  // 25: livekit.UpdateDispatchQueueConfigRequest.config:type_name -> livekit.DispatchQueueConfig
+	6,  // 26: livekit.UpdateDispatchQueueConfigResponse.config:type_name -> livekit.DispatchQueueConfig
+	0,  // 27: livekit.JobGroup.StatusCount.status:type_name -> livekit.QueuedJobStatus
+	7,  // 28: livekit.AgentDispatchQueue.AddJobs:input_type -> livekit.AddJobsRequest
+	9,  // 29: livekit.AgentDispatchQueue.GetJob:input_type -> livekit.GetJobRequest
+	11, // 30: livekit.AgentDispatchQueue.ListJobs:input_type -> livekit.ListJobsRequest
+	13, // 31: livekit.AgentDispatchQueue.RemoveJob:input_type -> livekit.RemoveJobRequest
+	15, // 32: livekit.AgentDispatchQueue.RetryJobs:input_type -> livekit.RetryJobsRequest
+	17, // 33: livekit.AgentDispatchQueue.ListJobGroups:input_type -> livekit.ListJobGroupsRequest
+	19, // 34: livekit.AgentDispatchQueue.PauseJobGroup:input_type -> livekit.PauseJobGroupRequest
+	21, // 35: livekit.AgentDispatchQueue.ResumeJobGroup:input_type -> livekit.ResumeJobGroupRequest
+	23, // 36: livekit.AgentDispatchQueue.CancelJobGroup:input_type -> livekit.CancelJobGroupRequest
+	25, // 37: livekit.AgentDispatchQueue.DeleteJobGroup:input_type -> livekit.DeleteJobGroupRequest
+	27, // 38: livekit.AgentDispatchQueue.GetDispatchQueueConfig:input_type -> livekit.GetDispatchQueueConfigRequest
+	29, // 39: livekit.AgentDispatchQueue.UpdateDispatchQueueConfig:input_type -> livekit.UpdateDispatchQueueConfigRequest
+	8,  // 40: livekit.AgentDispatchQueue.AddJobs:output_type -> livekit.AddJobsResponse
+	10, // 41: livekit.AgentDispatchQueue.GetJob:output_type -> livekit.GetJobResponse
+	12, // 42: livekit.AgentDispatchQueue.ListJobs:output_type -> livekit.ListJobsResponse
+	14, // 43: livekit.AgentDispatchQueue.RemoveJob:output_type -> livekit.RemoveJobResponse
+	16, // 44: livekit.AgentDispatchQueue.RetryJobs:output_type -> livekit.RetryJobsResponse
+	18, // 45: livekit.AgentDispatchQueue.ListJobGroups:output_type -> livekit.ListJobGroupsResponse
+	20, // 46: livekit.AgentDispatchQueue.PauseJobGroup:output_type -> livekit.PauseJobGroupResponse
+	22, // 47: livekit.AgentDispatchQueue.ResumeJobGroup:output_type -> livekit.ResumeJobGroupResponse
+	24, // 48: livekit.AgentDispatchQueue.CancelJobGroup:output_type -> livekit.CancelJobGroupResponse
+	26, // 49: livekit.AgentDispatchQueue.DeleteJobGroup:output_type -> livekit.DeleteJobGroupResponse
+	28, // 50: livekit.AgentDispatchQueue.GetDispatchQueueConfig:output_type -> livekit.GetDispatchQueueConfigResponse
+	30, // 51: livekit.AgentDispatchQueue.UpdateDispatchQueueConfig:output_type -> livekit.UpdateDispatchQueueConfigResponse
+	40, // [40:52] is the sub-list for method output_type
+	28, // [28:40] is the sub-list for method input_type
+	28, // [28:28] is the sub-list for extension type_name
+	28, // [28:28] is the sub-list for extension extendee
+	0,  // [0:28] is the sub-list for field type_name
 }
 
 func init() { file_livekit_agent_dispatch_queue_proto_init() }
@@ -1860,20 +2087,21 @@ func file_livekit_agent_dispatch_queue_proto_init() {
 	file_livekit_models_proto_init()
 	file_livekit_agent_dispatch_queue_proto_msgTypes[0].OneofWrappers = []any{}
 	file_livekit_agent_dispatch_queue_proto_msgTypes[1].OneofWrappers = []any{}
-	file_livekit_agent_dispatch_queue_proto_msgTypes[4].OneofWrappers = []any{}
-	file_livekit_agent_dispatch_queue_proto_msgTypes[8].OneofWrappers = []any{}
-	file_livekit_agent_dispatch_queue_proto_msgTypes[12].OneofWrappers = []any{}
-	file_livekit_agent_dispatch_queue_proto_msgTypes[16].OneofWrappers = []any{}
-	file_livekit_agent_dispatch_queue_proto_msgTypes[18].OneofWrappers = []any{}
-	file_livekit_agent_dispatch_queue_proto_msgTypes[20].OneofWrappers = []any{}
-	file_livekit_agent_dispatch_queue_proto_msgTypes[22].OneofWrappers = []any{}
+	file_livekit_agent_dispatch_queue_proto_msgTypes[3].OneofWrappers = []any{}
+	file_livekit_agent_dispatch_queue_proto_msgTypes[5].OneofWrappers = []any{}
+	file_livekit_agent_dispatch_queue_proto_msgTypes[9].OneofWrappers = []any{}
+	file_livekit_agent_dispatch_queue_proto_msgTypes[13].OneofWrappers = []any{}
+	file_livekit_agent_dispatch_queue_proto_msgTypes[17].OneofWrappers = []any{}
+	file_livekit_agent_dispatch_queue_proto_msgTypes[19].OneofWrappers = []any{}
+	file_livekit_agent_dispatch_queue_proto_msgTypes[21].OneofWrappers = []any{}
+	file_livekit_agent_dispatch_queue_proto_msgTypes[23].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_livekit_agent_dispatch_queue_proto_rawDesc), len(file_livekit_agent_dispatch_queue_proto_rawDesc)),
-			NumEnums:      1,
-			NumMessages:   30,
+			NumEnums:      2,
+			NumMessages:   32,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

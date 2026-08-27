@@ -93,6 +93,14 @@ message QueuedJobInput {
   // Per-job callbacks, signed with the project key, as with Egress per-request
   // webhooks. Project-level webhooks fire regardless.
   repeated WebhookConfig webhooks = 9;
+
+  // Classification labels, used to scope DispatchLimits. Not forwarded to the
+  // agent - use attributes for that.
+  //
+  // Values must name a class, never an identity: "insurer":"acme-health" is
+  // right, a phone number is not. Identities make the label set grow with the
+  // campaign and put PII in a configuration surface.
+  map<string, string> labels = 10;
 }
 
 message QueuedJob {
@@ -126,6 +134,9 @@ message JobGroup {
   bool paused = 2;
   google.protobuf.Timestamp created_at = 3;
   repeated StatusCount counts = 4;
+  // Jobs from this group running at once, as set when the group was created.
+  // Zero means the dispatcher default applies.
+  uint32 concurrency_limit = 5;
 
   // Proto3 forbids enum map keys, so counts by status are a repeated pair.
   message StatusCount {
@@ -134,10 +145,55 @@ message JobGroup {
   }
 }
 
+// Which slice of the project's queued traffic a DispatchLimit applies to.
+enum DispatchLimitScope {
+  // The project's whole queue.
+  DISPATCH_LIMIT_SCOPE_UNSPECIFIED = 0;
+  // QueuedJobInput.agent_name.
+  DISPATCH_LIMIT_SCOPE_AGENT = 1;
+  // The QueuedJobInput.labels entry named by DispatchLimit.label.
+  DISPATCH_LIMIT_SCOPE_LABEL = 2;
+}
+
+// One limit over a slice of the project's queued traffic. A job is evaluated
+// against every limit it matches and the smallest remaining budget wins.
+//
+// These bound what this queue admits. They do not bound inbound sessions or
+// direct AgentDispatchService.CreateDispatch calls, so they are not a cap on
+// an agent's total concurrency.
+message DispatchLimit {
+  DispatchLimitScope scope = 1;
+  // Which value of the scoped attribute this limit covers. Empty with a scope
+  // set means every distinct value gets its own budget of this size, so one
+  // rule can cover all agents or all label values without enumerating them.
+  string key = 2;
+  // SCOPE_LABEL only: which QueuedJobInput.labels key to slice on.
+  string label = 3;
+
+  // Jobs from this scope running at once. Unset is unlimited; 0 blocks the
+  // scope without touching its jobs.
+  optional uint32 max_concurrent = 4;
+  // Dispatch starts allowed in any rolling 60 seconds - not calendar minutes.
+  // The scheduler releases this budget in slices across admission rounds, so a
+  // minute's worth never lands at once. Unset is unrated.
+  optional uint32 max_starts_per_minute = 5;
+}
+
 message DispatchQueueConfig {
-  // Concurrency the project holds back for inbound sessions. Outbound
-  // admission is capped at the project's remaining reservations minus this.
-  uint32 reserved_inbound_concurrency = 1;
+  // How far below the project's capacity outbound admission stops.
+  //
+  // Outbound is already adaptive: admission is computed from capacity
+  // REMAINING, so every inbound session lowers what outbound may take with no
+  // configuration at all. This setting is not that adaptation. It is the fixed
+  // margin on top of it, covering sessions that arrive between one admission
+  // round and the next, before outbound has recomputed.
+  //
+  // Size it as arrivals per second times a few seconds, NOT as peak inbound
+  // concurrency. A project taking 5 inbound calls/sec wants roughly 10-20 here
+  // even if it runs 500 inbound calls at once.
+  uint32 outbound_headroom = 1;
+
+  repeated DispatchLimit limits = 2;
 }
 
 message AddJobsRequest {
@@ -145,6 +201,11 @@ message AddJobsRequest {
   repeated QueuedJobInput jobs = 1;
   // Attach every job in this request to a group, created on first use.
   optional string group_id = 2 [(logger.name) = "groupID"];
+  // Jobs from this group to run at once. Applied when the group is created and
+  // ignored on later adds to the same group. Unset uses the dispatcher
+  // default. Group limits live here rather than in DispatchQueueConfig because
+  // groups are per-campaign and would otherwise churn the project config.
+  optional uint32 group_concurrency_limit = 3;
 }
 
 message AddJobsResponse {
@@ -239,8 +300,10 @@ message GetDispatchQueueConfigResponse {
   DispatchQueueConfig config = 1;
 }
 
+// Replaces the stored config wholesale, so an omitted limit is a removed
+// limit. Read-modify-write to change one field.
 message UpdateDispatchQueueConfigRequest {
-  uint32 reserved_inbound_concurrency = 1;
+  DispatchQueueConfig config = 1;
 }
 
 message UpdateDispatchQueueConfigResponse {

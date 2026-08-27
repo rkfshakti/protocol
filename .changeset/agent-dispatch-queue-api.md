@@ -3,4 +3,4 @@
 "@livekit/protocol": patch
 ---
 
-Add the `AgentDispatchQueue` service with `QueuedJob` / `QueuedJobInput` / `QueuedJobStatus`, job group and queue config messages, and an `AgentGrant.DispatchAdmin` grant
+Add the `AgentDispatchQueue` service with `QueuedJob` / `QueuedJobInput` / `QueuedJobStatus`, job group messages, `DispatchQueueConfig` / `DispatchLimit` / `DispatchLimitScope`, and an `AgentGrant.DispatchAdmin` grant
