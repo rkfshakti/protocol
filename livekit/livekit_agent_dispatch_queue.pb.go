@@ -41,7 +41,7 @@ type QueuedJobStatus int32
 
 const (
 	QueuedJobStatus_QUEUED_JOB_STATUS_UNSPECIFIED QueuedJobStatus = 0
-	// Awaiting capacity, or waiting on not_before.
+	// Awaiting capacity, or waiting on start_after.
 	QueuedJobStatus_QUEUED_JOB_STATUS_QUEUED QueuedJobStatus = 1
 	// Admitted; CreateDispatch in flight.
 	QueuedJobStatus_QUEUED_JOB_STATUS_DISPATCHING QueuedJobStatus = 2
@@ -52,7 +52,7 @@ const (
 	// Removed, or cancelled with its group, before it was admitted.
 	QueuedJobStatus_QUEUED_JOB_STATUS_CANCELLED QueuedJobStatus = 6
 	// Still queued at expires_at; never dispatched. Includes a job whose
-	// not_before never arrived before it expired.
+	// start_after never arrived before it expired.
 	QueuedJobStatus_QUEUED_JOB_STATUS_EXPIRED QueuedJobStatus = 7
 )
 
@@ -178,7 +178,7 @@ type QueuedJobInput struct {
 	RestartPolicy  JobRestartPolicy  `protobuf:"varint,7,opt,name=restart_policy,json=restartPolicy,proto3,enum=livekit.JobRestartPolicy" json:"restart_policy,omitempty"`
 	// Never dispatch after this time; the job goes to EXPIRED instead. Capped at
 	// 8 days out to stay inside the row retention window, which also bounds
-	// not_before.
+	// start_after.
 	ExpiresAt *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=expires_at,json=expiresAt,proto3,oneof" json:"expires_at,omitempty"`
 	// Per-job callbacks, signed with the project key, as with Egress per-request
 	// webhooks. Project-level webhooks fire regardless.
@@ -188,13 +188,13 @@ type QueuedJobInput struct {
 	//
 	// Values must name a class, never an identity: "insurer":"acme-health" is
 	// right, a phone number is not. Identities make the label set grow with the
-	// campaign and put PII in a configuration surface.
+	// job set and put PII in a configuration surface.
 	Labels map[string]string `protobuf:"bytes,10,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	// Never dispatch before this time. A floor, not an appointment: the job
-	// still waits on capacity once eligible, and eligibility only filters the
-	// FIFO scan - order stays created_at, so a job held here keeps its original
-	// place in line. Must be before expires_at.
-	NotBefore     *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=not_before,json=notBefore,proto3,oneof" json:"not_before,omitempty"`
+	// Hold the job until this time. A floor, not an appointment: the job still
+	// waits on capacity once eligible, and eligibility only filters the FIFO
+	// scan - order stays created_at, so a held job keeps its original place in
+	// line. Must be before expires_at.
+	StartAfter    *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=start_after,json=startAfter,proto3,oneof" json:"start_after,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -299,9 +299,9 @@ func (x *QueuedJobInput) GetLabels() map[string]string {
 	return nil
 }
 
-func (x *QueuedJobInput) GetNotBefore() *timestamppb.Timestamp {
+func (x *QueuedJobInput) GetStartAfter() *timestamppb.Timestamp {
 	if x != nil {
-		return x.NotBefore
+		return x.StartAfter
 	}
 	return nil
 }
@@ -527,9 +527,9 @@ func (x *JobGroup) GetConcurrencyLimit() uint32 {
 // One limit over a slice of the project's queued traffic. A job is evaluated
 // against every limit it matches and the smallest remaining budget wins.
 //
-// These bound what this queue admits. They do not bound inbound sessions or
-// direct AgentDispatchService.CreateDispatch calls, so they are not a cap on
-// an agent's total concurrency.
+// These bound what this queue admits. They do not bound sessions started
+// outside it, including direct AgentDispatchService.CreateDispatch calls, so
+// they are not a cap on an agent's total concurrency.
 type DispatchLimit struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Scope DispatchLimitScope     `protobuf:"varint,1,opt,name=scope,proto3,enum=livekit.DispatchLimitScope" json:"scope,omitempty"`
@@ -617,21 +617,23 @@ func (x *DispatchLimit) GetMaxStartsPerMinute() uint32 {
 
 type DispatchQueueConfig struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// How far below the project's capacity outbound admission stops.
+	// The queue stops admitting while free project capacity would fall below
+	// this. Everything else the project runs - sessions a user started, direct
+	// AgentDispatchService.CreateDispatch calls, anything not from this queue -
+	// draws on the same capacity, and this is what the queue leaves for it.
 	//
-	// Outbound is already adaptive: admission is computed from capacity
-	// REMAINING, so every inbound session lowers what outbound may take with no
-	// configuration at all. This setting is not that adaptation. It is the fixed
-	// margin on top of it, covering sessions that arrive between one admission
-	// round and the next, before outbound has recomputed.
+	// The queue is already adaptive: admission reads capacity REMAINING, so
+	// other work lowers what the queue may take with no configuration at all.
+	// This is the fixed margin on top of that, covering arrivals between one
+	// admission round and the next, before the queue has recomputed.
 	//
-	// Size it as arrivals per second times a few seconds, NOT as peak inbound
-	// concurrency. A project taking 5 inbound calls/sec wants roughly 10-20 here
-	// even if it runs 500 inbound calls at once.
-	OutboundHeadroom uint32           `protobuf:"varint,1,opt,name=outbound_headroom,json=outboundHeadroom,proto3" json:"outbound_headroom,omitempty"`
-	Limits           []*DispatchLimit `protobuf:"bytes,2,rep,name=limits,proto3" json:"limits,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Size it as arrivals per second times a few seconds, NOT as the peak
+	// concurrency of that other work. A project starting 5 sessions/sec wants
+	// roughly 10-20 here even if it runs 500 at once.
+	MinFreeCapacity uint32           `protobuf:"varint,1,opt,name=min_free_capacity,json=minFreeCapacity,proto3" json:"min_free_capacity,omitempty"`
+	Limits          []*DispatchLimit `protobuf:"bytes,2,rep,name=limits,proto3" json:"limits,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *DispatchQueueConfig) Reset() {
@@ -664,9 +666,9 @@ func (*DispatchQueueConfig) Descriptor() ([]byte, []int) {
 	return file_livekit_agent_dispatch_queue_proto_rawDescGZIP(), []int{4}
 }
 
-func (x *DispatchQueueConfig) GetOutboundHeadroom() uint32 {
+func (x *DispatchQueueConfig) GetMinFreeCapacity() uint32 {
 	if x != nil {
-		return x.OutboundHeadroom
+		return x.MinFreeCapacity
 	}
 	return 0
 }
@@ -680,14 +682,14 @@ func (x *DispatchQueueConfig) GetLimits() []*DispatchLimit {
 
 type AddJobsRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Up to 1,000 per request; clients loop for larger campaigns.
+	// Up to 1,000 per request; clients loop to add more.
 	Jobs []*QueuedJobInput `protobuf:"bytes,1,rep,name=jobs,proto3" json:"jobs,omitempty"`
 	// Attach every job in this request to a group, created on first use.
 	GroupId *string `protobuf:"bytes,2,opt,name=group_id,json=groupId,proto3,oneof" json:"group_id,omitempty"`
 	// Jobs from this group to run at once. Applied when the group is created and
 	// ignored on later adds to the same group. Unset uses the dispatcher
 	// default. Group limits live here rather than in DispatchQueueConfig because
-	// groups are per-campaign and would otherwise churn the project config.
+	// groups are short-lived and would otherwise churn the project config.
 	GroupConcurrencyLimit *uint32 `protobuf:"varint,3,opt,name=group_concurrency_limit,json=groupConcurrencyLimit,proto3,oneof" json:"group_concurrency_limit,omitempty"`
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
@@ -1090,7 +1092,11 @@ type RetryJobsRequest struct {
 	state  protoimpl.MessageState `protogen:"open.v1"`
 	JobIds []string               `protobuf:"bytes,1,rep,name=job_ids,json=jobIds,proto3" json:"job_ids,omitempty"`
 	// Replaces expires_at on the retried jobs.
-	ExpiresAt     *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=expires_at,json=expiresAt,proto3,oneof" json:"expires_at,omitempty"`
+	ExpiresAt *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=expires_at,json=expiresAt,proto3,oneof" json:"expires_at,omitempty"`
+	// Replaces start_after on the retried jobs, to hold a retry back rather than
+	// re-queueing it immediately. Unset clears any start_after the job carried,
+	// since the original hold has already elapsed.
+	StartAfter    *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=start_after,json=startAfter,proto3,oneof" json:"start_after,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1135,6 +1141,13 @@ func (x *RetryJobsRequest) GetJobIds() []string {
 func (x *RetryJobsRequest) GetExpiresAt() *timestamppb.Timestamp {
 	if x != nil {
 		return x.ExpiresAt
+	}
+	return nil
+}
+
+func (x *RetryJobsRequest) GetStartAfter() *timestamppb.Timestamp {
+	if x != nil {
+		return x.StartAfter
 	}
 	return nil
 }
@@ -1816,7 +1829,7 @@ var File_livekit_agent_dispatch_queue_proto protoreflect.FileDescriptor
 
 const file_livekit_agent_dispatch_queue_proto_rawDesc = "" +
 	"\n" +
-	"\"livekit_agent_dispatch_queue.proto\x12\alivekit\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1clivekit_agent_dispatch.proto\x1a\x14livekit_models.proto\x1a\x14logger/options.proto\"\xcf\x05\n" +
+	"\"livekit_agent_dispatch_queue.proto\x12\alivekit\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1clivekit_agent_dispatch.proto\x1a\x14livekit_models.proto\x1a\x14logger/options.proto\"\xd2\x05\n" +
 	"\x0eQueuedJobInput\x12\x1d\n" +
 	"\n" +
 	"agent_name\x18\x01 \x01(\tR\tagentName\x12\x1b\n" +
@@ -1834,17 +1847,17 @@ const file_livekit_agent_dispatch_queue_proto_rawDesc = "" +
 	"expires_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampH\x00R\texpiresAt\x88\x01\x01\x122\n" +
 	"\bwebhooks\x18\t \x03(\v2\x16.livekit.WebhookConfigR\bwebhooks\x12;\n" +
 	"\x06labels\x18\n" +
-	" \x03(\v2#.livekit.QueuedJobInput.LabelsEntryR\x06labels\x12>\n" +
-	"\n" +
-	"not_before\x18\v \x01(\v2\x1a.google.protobuf.TimestampH\x01R\tnotBefore\x88\x01\x01\x1a=\n" +
+	" \x03(\v2#.livekit.QueuedJobInput.LabelsEntryR\x06labels\x12@\n" +
+	"\vstart_after\x18\v \x01(\v2\x1a.google.protobuf.TimestampH\x01R\n" +
+	"startAfter\x88\x01\x01\x1a=\n" +
 	"\x0fAttributesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\r\n" +
-	"\v_expires_atB\r\n" +
-	"\v_not_before\"\x9d\x04\n" +
+	"\v_expires_atB\x0e\n" +
+	"\f_start_after\"\x9d\x04\n" +
 	"\tQueuedJob\x12\x18\n" +
 	"\x02id\x18\x01 \x01(\tB\b\xbaP\x05jobIDR\x02id\x12*\n" +
 	"\bgroup_id\x18\x02 \x01(\tB\n" +
@@ -1882,9 +1895,9 @@ const file_livekit_agent_dispatch_queue_proto_rawDesc = "" +
 	"\x0emax_concurrent\x18\x04 \x01(\rH\x00R\rmaxConcurrent\x88\x01\x01\x126\n" +
 	"\x15max_starts_per_minute\x18\x05 \x01(\rH\x01R\x12maxStartsPerMinute\x88\x01\x01B\x11\n" +
 	"\x0f_max_concurrentB\x18\n" +
-	"\x16_max_starts_per_minute\"r\n" +
-	"\x13DispatchQueueConfig\x12+\n" +
-	"\x11outbound_headroom\x18\x01 \x01(\rR\x10outboundHeadroom\x12.\n" +
+	"\x16_max_starts_per_minute\"q\n" +
+	"\x13DispatchQueueConfig\x12*\n" +
+	"\x11min_free_capacity\x18\x01 \x01(\rR\x0fminFreeCapacity\x12.\n" +
 	"\x06limits\x18\x02 \x03(\v2\x16.livekit.DispatchLimitR\x06limits\"\xcf\x01\n" +
 	"\x0eAddJobsRequest\x12+\n" +
 	"\x04jobs\x18\x01 \x03(\v2\x17.livekit.QueuedJobInputR\x04jobs\x12*\n" +
@@ -1916,12 +1929,15 @@ const file_livekit_agent_dispatch_queue_proto_rawDesc = "" +
 	"\x0fnext_page_token\x18\x02 \x01(\v2\x18.livekit.TokenPaginationR\rnextPageToken\"3\n" +
 	"\x10RemoveJobRequest\x12\x1f\n" +
 	"\x06job_id\x18\x01 \x01(\tB\b\xbaP\x05jobIDR\x05jobId\"\x13\n" +
-	"\x11RemoveJobResponse\"\x85\x01\n" +
+	"\x11RemoveJobResponse\"\xd7\x01\n" +
 	"\x10RetryJobsRequest\x12\"\n" +
 	"\ajob_ids\x18\x01 \x03(\tB\t\xbaP\x06jobIDsR\x06jobIds\x12>\n" +
 	"\n" +
-	"expires_at\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampH\x00R\texpiresAt\x88\x01\x01B\r\n" +
-	"\v_expires_at\";\n" +
+	"expires_at\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampH\x00R\texpiresAt\x88\x01\x01\x12@\n" +
+	"\vstart_after\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampH\x01R\n" +
+	"startAfter\x88\x01\x01B\r\n" +
+	"\v_expires_atB\x0e\n" +
+	"\f_start_after\";\n" +
 	"\x11RetryJobsResponse\x12&\n" +
 	"\x04jobs\x18\x01 \x03(\v2\x12.livekit.QueuedJobR\x04jobs\"\x16\n" +
 	"\x14ListJobGroupsRequest\"B\n" +
@@ -2041,7 +2057,7 @@ var file_livekit_agent_dispatch_queue_proto_depIdxs = []int32{
 	35, // 2: livekit.QueuedJobInput.expires_at:type_name -> google.protobuf.Timestamp
 	36, // 3: livekit.QueuedJobInput.webhooks:type_name -> livekit.WebhookConfig
 	32, // 4: livekit.QueuedJobInput.labels:type_name -> livekit.QueuedJobInput.LabelsEntry
-	35, // 5: livekit.QueuedJobInput.not_before:type_name -> google.protobuf.Timestamp
+	35, // 5: livekit.QueuedJobInput.start_after:type_name -> google.protobuf.Timestamp
 	0,  // 6: livekit.QueuedJob.status:type_name -> livekit.QueuedJobStatus
 	2,  // 7: livekit.QueuedJob.input:type_name -> livekit.QueuedJobInput
 	35, // 8: livekit.QueuedJob.created_at:type_name -> google.protobuf.Timestamp
@@ -2059,41 +2075,42 @@ var file_livekit_agent_dispatch_queue_proto_depIdxs = []int32{
 	3,  // 20: livekit.ListJobsResponse.jobs:type_name -> livekit.QueuedJob
 	37, // 21: livekit.ListJobsResponse.next_page_token:type_name -> livekit.TokenPagination
 	35, // 22: livekit.RetryJobsRequest.expires_at:type_name -> google.protobuf.Timestamp
-	3,  // 23: livekit.RetryJobsResponse.jobs:type_name -> livekit.QueuedJob
-	4,  // 24: livekit.ListJobGroupsResponse.groups:type_name -> livekit.JobGroup
-	6,  // 25: livekit.GetDispatchQueueConfigResponse.config:type_name -> livekit.DispatchQueueConfig
-	6,  // 26: livekit.UpdateDispatchQueueConfigRequest.config:type_name -> livekit.DispatchQueueConfig
-	6,  // 27: livekit.UpdateDispatchQueueConfigResponse.config:type_name -> livekit.DispatchQueueConfig
-	0,  // 28: livekit.JobGroup.StatusCount.status:type_name -> livekit.QueuedJobStatus
-	7,  // 29: livekit.AgentDispatchQueue.AddJobs:input_type -> livekit.AddJobsRequest
-	9,  // 30: livekit.AgentDispatchQueue.GetJob:input_type -> livekit.GetJobRequest
-	11, // 31: livekit.AgentDispatchQueue.ListJobs:input_type -> livekit.ListJobsRequest
-	13, // 32: livekit.AgentDispatchQueue.RemoveJob:input_type -> livekit.RemoveJobRequest
-	15, // 33: livekit.AgentDispatchQueue.RetryJobs:input_type -> livekit.RetryJobsRequest
-	17, // 34: livekit.AgentDispatchQueue.ListJobGroups:input_type -> livekit.ListJobGroupsRequest
-	19, // 35: livekit.AgentDispatchQueue.PauseJobGroup:input_type -> livekit.PauseJobGroupRequest
-	21, // 36: livekit.AgentDispatchQueue.ResumeJobGroup:input_type -> livekit.ResumeJobGroupRequest
-	23, // 37: livekit.AgentDispatchQueue.CancelJobGroup:input_type -> livekit.CancelJobGroupRequest
-	25, // 38: livekit.AgentDispatchQueue.DeleteJobGroup:input_type -> livekit.DeleteJobGroupRequest
-	27, // 39: livekit.AgentDispatchQueue.GetDispatchQueueConfig:input_type -> livekit.GetDispatchQueueConfigRequest
-	29, // 40: livekit.AgentDispatchQueue.UpdateDispatchQueueConfig:input_type -> livekit.UpdateDispatchQueueConfigRequest
-	8,  // 41: livekit.AgentDispatchQueue.AddJobs:output_type -> livekit.AddJobsResponse
-	10, // 42: livekit.AgentDispatchQueue.GetJob:output_type -> livekit.GetJobResponse
-	12, // 43: livekit.AgentDispatchQueue.ListJobs:output_type -> livekit.ListJobsResponse
-	14, // 44: livekit.AgentDispatchQueue.RemoveJob:output_type -> livekit.RemoveJobResponse
-	16, // 45: livekit.AgentDispatchQueue.RetryJobs:output_type -> livekit.RetryJobsResponse
-	18, // 46: livekit.AgentDispatchQueue.ListJobGroups:output_type -> livekit.ListJobGroupsResponse
-	20, // 47: livekit.AgentDispatchQueue.PauseJobGroup:output_type -> livekit.PauseJobGroupResponse
-	22, // 48: livekit.AgentDispatchQueue.ResumeJobGroup:output_type -> livekit.ResumeJobGroupResponse
-	24, // 49: livekit.AgentDispatchQueue.CancelJobGroup:output_type -> livekit.CancelJobGroupResponse
-	26, // 50: livekit.AgentDispatchQueue.DeleteJobGroup:output_type -> livekit.DeleteJobGroupResponse
-	28, // 51: livekit.AgentDispatchQueue.GetDispatchQueueConfig:output_type -> livekit.GetDispatchQueueConfigResponse
-	30, // 52: livekit.AgentDispatchQueue.UpdateDispatchQueueConfig:output_type -> livekit.UpdateDispatchQueueConfigResponse
-	41, // [41:53] is the sub-list for method output_type
-	29, // [29:41] is the sub-list for method input_type
-	29, // [29:29] is the sub-list for extension type_name
-	29, // [29:29] is the sub-list for extension extendee
-	0,  // [0:29] is the sub-list for field type_name
+	35, // 23: livekit.RetryJobsRequest.start_after:type_name -> google.protobuf.Timestamp
+	3,  // 24: livekit.RetryJobsResponse.jobs:type_name -> livekit.QueuedJob
+	4,  // 25: livekit.ListJobGroupsResponse.groups:type_name -> livekit.JobGroup
+	6,  // 26: livekit.GetDispatchQueueConfigResponse.config:type_name -> livekit.DispatchQueueConfig
+	6,  // 27: livekit.UpdateDispatchQueueConfigRequest.config:type_name -> livekit.DispatchQueueConfig
+	6,  // 28: livekit.UpdateDispatchQueueConfigResponse.config:type_name -> livekit.DispatchQueueConfig
+	0,  // 29: livekit.JobGroup.StatusCount.status:type_name -> livekit.QueuedJobStatus
+	7,  // 30: livekit.AgentDispatchQueue.AddJobs:input_type -> livekit.AddJobsRequest
+	9,  // 31: livekit.AgentDispatchQueue.GetJob:input_type -> livekit.GetJobRequest
+	11, // 32: livekit.AgentDispatchQueue.ListJobs:input_type -> livekit.ListJobsRequest
+	13, // 33: livekit.AgentDispatchQueue.RemoveJob:input_type -> livekit.RemoveJobRequest
+	15, // 34: livekit.AgentDispatchQueue.RetryJobs:input_type -> livekit.RetryJobsRequest
+	17, // 35: livekit.AgentDispatchQueue.ListJobGroups:input_type -> livekit.ListJobGroupsRequest
+	19, // 36: livekit.AgentDispatchQueue.PauseJobGroup:input_type -> livekit.PauseJobGroupRequest
+	21, // 37: livekit.AgentDispatchQueue.ResumeJobGroup:input_type -> livekit.ResumeJobGroupRequest
+	23, // 38: livekit.AgentDispatchQueue.CancelJobGroup:input_type -> livekit.CancelJobGroupRequest
+	25, // 39: livekit.AgentDispatchQueue.DeleteJobGroup:input_type -> livekit.DeleteJobGroupRequest
+	27, // 40: livekit.AgentDispatchQueue.GetDispatchQueueConfig:input_type -> livekit.GetDispatchQueueConfigRequest
+	29, // 41: livekit.AgentDispatchQueue.UpdateDispatchQueueConfig:input_type -> livekit.UpdateDispatchQueueConfigRequest
+	8,  // 42: livekit.AgentDispatchQueue.AddJobs:output_type -> livekit.AddJobsResponse
+	10, // 43: livekit.AgentDispatchQueue.GetJob:output_type -> livekit.GetJobResponse
+	12, // 44: livekit.AgentDispatchQueue.ListJobs:output_type -> livekit.ListJobsResponse
+	14, // 45: livekit.AgentDispatchQueue.RemoveJob:output_type -> livekit.RemoveJobResponse
+	16, // 46: livekit.AgentDispatchQueue.RetryJobs:output_type -> livekit.RetryJobsResponse
+	18, // 47: livekit.AgentDispatchQueue.ListJobGroups:output_type -> livekit.ListJobGroupsResponse
+	20, // 48: livekit.AgentDispatchQueue.PauseJobGroup:output_type -> livekit.PauseJobGroupResponse
+	22, // 49: livekit.AgentDispatchQueue.ResumeJobGroup:output_type -> livekit.ResumeJobGroupResponse
+	24, // 50: livekit.AgentDispatchQueue.CancelJobGroup:output_type -> livekit.CancelJobGroupResponse
+	26, // 51: livekit.AgentDispatchQueue.DeleteJobGroup:output_type -> livekit.DeleteJobGroupResponse
+	28, // 52: livekit.AgentDispatchQueue.GetDispatchQueueConfig:output_type -> livekit.GetDispatchQueueConfigResponse
+	30, // 53: livekit.AgentDispatchQueue.UpdateDispatchQueueConfig:output_type -> livekit.UpdateDispatchQueueConfigResponse
+	42, // [42:54] is the sub-list for method output_type
+	30, // [30:42] is the sub-list for method input_type
+	30, // [30:30] is the sub-list for extension type_name
+	30, // [30:30] is the sub-list for extension extendee
+	0,  // [0:30] is the sub-list for field type_name
 }
 
 func init() { file_livekit_agent_dispatch_queue_proto_init() }
