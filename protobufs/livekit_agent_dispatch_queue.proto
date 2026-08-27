@@ -1,0 +1,248 @@
+// Copyright 2026 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package livekit;
+option go_package = "github.com/livekit/protocol/livekit";
+option csharp_namespace = "LiveKit.Proto";
+option ruby_package = "LiveKit::Proto";
+
+import "google/protobuf/timestamp.proto";
+import "livekit_agent_dispatch.proto";
+import "livekit_models.proto";
+import "logger/options.proto";
+
+// AgentDispatchQueue accepts dispatches to run later, as project capacity
+// allows, instead of failing at the concurrency cap the way
+// AgentDispatchService.CreateDispatch does. A queued job becomes a real
+// AgentDispatch only once the queue admits it.
+//
+// Enqueue is a batch because the queue exists to take thousands of dispatches
+// in one request and let admission control pace them against the project's
+// remaining outbound capacity.
+//
+// Implemented in cloud only; OSS livekit-server does not serve this service.
+// The project is taken from the caller's credentials, never from the request.
+service AgentDispatchQueue {
+  rpc AddJobs(AddJobsRequest) returns (AddJobsResponse);
+  rpc GetJob(GetJobRequest) returns (GetJobResponse);
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+  rpc RemoveJob(RemoveJobRequest) returns (RemoveJobResponse);
+  rpc RetryJobs(RetryJobsRequest) returns (RetryJobsResponse);
+
+  // Group operations. The server returns Unimplemented for all five until the
+  // group model lands (AP-976).
+  rpc ListJobGroups(ListJobGroupsRequest) returns (ListJobGroupsResponse);
+  rpc PauseJobGroup(PauseJobGroupRequest) returns (PauseJobGroupResponse);
+  rpc ResumeJobGroup(ResumeJobGroupRequest) returns (ResumeJobGroupResponse);
+  rpc CancelJobGroup(CancelJobGroupRequest) returns (CancelJobGroupResponse);
+  rpc DeleteJobGroup(DeleteJobGroupRequest) returns (DeleteJobGroupResponse);
+
+  rpc GetDispatchQueueConfig(GetDispatchQueueConfigRequest) returns (GetDispatchQueueConfigResponse);
+  rpc UpdateDispatchQueueConfig(UpdateDispatchQueueConfigRequest) returns (UpdateDispatchQueueConfigResponse);
+}
+
+enum QueuedJobStatus {
+  QUEUED_JOB_STATUS_UNSPECIFIED = 0;
+  // Awaiting capacity.
+  QUEUED_JOB_STATUS_QUEUED = 1;
+  // Admitted; CreateDispatch in flight.
+  QUEUED_JOB_STATUS_DISPATCHING = 2;
+  // Dispatch created, agent job live.
+  QUEUED_JOB_STATUS_RUNNING = 3;
+  QUEUED_JOB_STATUS_SUCCEEDED = 4;
+  QUEUED_JOB_STATUS_FAILED = 5;
+  // Removed, or cancelled with its group, before it was admitted.
+  QUEUED_JOB_STATUS_CANCELLED = 6;
+  // Still queued at expires_at; never dispatched.
+  QUEUED_JOB_STATUS_EXPIRED = 7;
+}
+
+// What to dispatch. Mirrors CreateAgentDispatchRequest so that a queued job and
+// an immediate dispatch describe the same work.
+message QueuedJobInput {
+  // Must match the agent_name registered by the agent server.
+  string agent_name = 1;
+  // Required. The queue does not invent room names; a caller wanting one room
+  // per job supplies its own unique name.
+  string room_name = 2;
+  // Required, unique per project. Re-adding with the same key returns the
+  // existing job rather than dispatching twice.
+  string idempotency_key = 3;
+
+  string metadata = 4 [(logger.sensitivity) = SENSITIVITY_PII];
+  map<string, string> attributes = 5 [(logger.sensitivity) = SENSITIVITY_PII];
+  string deployment = 6;
+  JobRestartPolicy restart_policy = 7;
+
+  // Never dispatch after this time; the job goes to EXPIRED instead. Capped at
+  // 8 days out to stay inside the row retention window.
+  optional google.protobuf.Timestamp expires_at = 8;
+  // Per-job callbacks, signed with the project key, as with Egress per-request
+  // webhooks. Project-level webhooks fire regardless.
+  repeated WebhookConfig webhooks = 9;
+}
+
+message QueuedJob {
+  string id = 1 [(logger.name) = "jobID"];
+  optional string group_id = 2 [(logger.name) = "groupID"];
+  QueuedJobStatus status = 3;
+  QueuedJobInput input = 4;
+
+  // Set once dispatch is invoked; the join point into the dispatch APIs.
+  string dispatch_id = 5 [(logger.name) = "dispatchID"];
+  // Set once the room is created.
+  string room_id = 6 [(logger.name) = "roomID"];
+
+  // JSON the agent writes back before exiting; opaque to the queue and carried
+  // on the terminal webhook.
+  string result = 7 [(logger.sensitivity) = SENSITIVITY_PII];
+  // Set on FAILED, including exhaustion of infra retries.
+  string error = 8;
+  // Dispatch attempts made by the queue. Counts infra-level retries before a
+  // dispatch succeeds, not agent-side failures.
+  int32 attempts = 9;
+
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp dispatched_at = 11;
+  google.protobuf.Timestamp completed_at = 12;
+}
+
+message JobGroup {
+  string id = 1 [(logger.name) = "groupID"];
+  // A paused group admits nothing; jobs already in flight run to completion.
+  bool paused = 2;
+  google.protobuf.Timestamp created_at = 3;
+  repeated StatusCount counts = 4;
+
+  // Proto3 forbids enum map keys, so counts by status are a repeated pair.
+  message StatusCount {
+    QueuedJobStatus status = 1;
+    uint32 count = 2;
+  }
+}
+
+message DispatchQueueConfig {
+  // Concurrency the project holds back for inbound sessions. Outbound
+  // admission is capped at the project's remaining reservations minus this.
+  uint32 reserved_inbound_concurrency = 1;
+}
+
+message AddJobsRequest {
+  // Up to 1,000 per request; clients loop for larger campaigns.
+  repeated QueuedJobInput jobs = 1;
+  // Attach every job in this request to a group, created on first use.
+  optional string group_id = 2 [(logger.name) = "groupID"];
+}
+
+message AddJobsResponse {
+  // Same order and length as the request. Validation is atomic: if any input
+  // is invalid nothing is enqueued and the error enumerates every bad entry,
+  // so a rejected batch is safe to fix and resend in one pass. An input whose
+  // idempotency_key already existed yields the pre-existing job unchanged.
+  repeated QueuedJob jobs = 1;
+}
+
+message GetJobRequest {
+  string job_id = 1 [(logger.name) = "jobID"];
+}
+
+message GetJobResponse {
+  QueuedJob job = 1;
+}
+
+message ListJobsRequest {
+  optional string group_id = 1 [(logger.name) = "groupID"];
+  optional QueuedJobStatus status = 2;
+  optional TokenPagination page_token = 3;
+  optional int32 page_size = 4;
+}
+
+message ListJobsResponse {
+  repeated QueuedJob jobs = 1;
+  TokenPagination next_page_token = 2;
+}
+
+// Cancels a job that has not been admitted yet (QUEUED -> CANCELLED). A job
+// already DISPATCHING or RUNNING is left alone; tear down the live session
+// through DeleteDispatch or the room APIs instead.
+message RemoveJobRequest {
+  string job_id = 1 [(logger.name) = "jobID"];
+}
+
+message RemoveJobResponse {}
+
+// Re-queues jobs in a FAILED or EXPIRED state, reusing their rows and
+// idempotency keys instead of minting new jobs. Jobs in any other state are
+// returned untouched.
+message RetryJobsRequest {
+  repeated string job_ids = 1 [(logger.name) = "jobIDs"];
+  // Replaces expires_at on the retried jobs.
+  optional google.protobuf.Timestamp expires_at = 2;
+}
+
+message RetryJobsResponse {
+  repeated QueuedJob jobs = 1;
+}
+
+message ListJobGroupsRequest {}
+
+message ListJobGroupsResponse {
+  repeated JobGroup groups = 1;
+}
+
+// On every group operation below, an unset group_id applies the operation at
+// project scope, across grouped and ungrouped jobs alike.
+message PauseJobGroupRequest {
+  optional string group_id = 1 [(logger.name) = "groupID"];
+}
+
+message PauseJobGroupResponse {}
+
+message ResumeJobGroupRequest {
+  optional string group_id = 1 [(logger.name) = "groupID"];
+}
+
+message ResumeJobGroupResponse {}
+
+// Cancels the queued jobs in the group; jobs already in flight run to
+// completion.
+message CancelJobGroupRequest {
+  optional string group_id = 1 [(logger.name) = "groupID"];
+}
+
+message CancelJobGroupResponse {}
+
+// Cancels the remaining queued jobs and hides the group and its terminal jobs
+// from listings. Rows are kept for the retention window.
+message DeleteJobGroupRequest {
+  optional string group_id = 1 [(logger.name) = "groupID"];
+}
+
+message DeleteJobGroupResponse {}
+
+message GetDispatchQueueConfigRequest {}
+
+message GetDispatchQueueConfigResponse {
+  DispatchQueueConfig config = 1;
+}
+
+message UpdateDispatchQueueConfigRequest {
+  uint32 reserved_inbound_concurrency = 1;
+}
+
+message UpdateDispatchQueueConfigResponse {
+  DispatchQueueConfig config = 1;
+}
