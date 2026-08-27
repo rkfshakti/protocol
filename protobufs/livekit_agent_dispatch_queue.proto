@@ -31,7 +31,7 @@ import "logger/options.proto";
 //
 // Enqueue is a batch because the queue exists to take thousands of dispatches
 // in one request and let admission control pace them against the project's
-// remaining outbound capacity.
+// remaining capacity.
 //
 // Implemented in cloud only; OSS livekit-server does not serve this service.
 // The project is taken from the caller's credentials, never from the request.
@@ -56,7 +56,7 @@ service AgentDispatchQueue {
 
 enum QueuedJobStatus {
   QUEUED_JOB_STATUS_UNSPECIFIED = 0;
-  // Awaiting capacity, or waiting on not_before.
+  // Awaiting capacity, or waiting on start_after.
   QUEUED_JOB_STATUS_QUEUED = 1;
   // Admitted; CreateDispatch in flight.
   QUEUED_JOB_STATUS_DISPATCHING = 2;
@@ -67,7 +67,7 @@ enum QueuedJobStatus {
   // Removed, or cancelled with its group, before it was admitted.
   QUEUED_JOB_STATUS_CANCELLED = 6;
   // Still queued at expires_at; never dispatched. Includes a job whose
-  // not_before never arrived before it expired.
+  // start_after never arrived before it expired.
   QUEUED_JOB_STATUS_EXPIRED = 7;
 }
 
@@ -90,7 +90,7 @@ message QueuedJobInput {
 
   // Never dispatch after this time; the job goes to EXPIRED instead. Capped at
   // 8 days out to stay inside the row retention window, which also bounds
-  // not_before.
+  // start_after.
   optional google.protobuf.Timestamp expires_at = 8;
   // Per-job callbacks, signed with the project key, as with Egress per-request
   // webhooks. Project-level webhooks fire regardless.
@@ -101,14 +101,14 @@ message QueuedJobInput {
   //
   // Values must name a class, never an identity: "insurer":"acme-health" is
   // right, a phone number is not. Identities make the label set grow with the
-  // campaign and put PII in a configuration surface.
+  // job set and put PII in a configuration surface.
   map<string, string> labels = 10;
 
-  // Never dispatch before this time. A floor, not an appointment: the job
-  // still waits on capacity once eligible, and eligibility only filters the
-  // FIFO scan - order stays created_at, so a job held here keeps its original
-  // place in line. Must be before expires_at.
-  optional google.protobuf.Timestamp not_before = 11;
+  // Hold the job until this time. A floor, not an appointment: the job still
+  // waits on capacity once eligible, and eligibility only filters the FIFO
+  // scan - order stays created_at, so a held job keeps its original place in
+  // line. Must be before expires_at.
+  optional google.protobuf.Timestamp start_after = 11;
 }
 
 message QueuedJob {
@@ -166,9 +166,9 @@ enum DispatchLimitScope {
 // One limit over a slice of the project's queued traffic. A job is evaluated
 // against every limit it matches and the smallest remaining budget wins.
 //
-// These bound what this queue admits. They do not bound inbound sessions or
-// direct AgentDispatchService.CreateDispatch calls, so they are not a cap on
-// an agent's total concurrency.
+// These bound what this queue admits. They do not bound sessions started
+// outside it, including direct AgentDispatchService.CreateDispatch calls, so
+// they are not a cap on an agent's total concurrency.
 message DispatchLimit {
   DispatchLimitScope scope = 1;
   // Which value of the scoped attribute this limit covers. Empty with a scope
@@ -188,31 +188,33 @@ message DispatchLimit {
 }
 
 message DispatchQueueConfig {
-  // How far below the project's capacity outbound admission stops.
+  // The queue stops admitting while free project capacity would fall below
+  // this. Everything else the project runs - sessions a user started, direct
+  // AgentDispatchService.CreateDispatch calls, anything not from this queue -
+  // draws on the same capacity, and this is what the queue leaves for it.
   //
-  // Outbound is already adaptive: admission is computed from capacity
-  // REMAINING, so every inbound session lowers what outbound may take with no
-  // configuration at all. This setting is not that adaptation. It is the fixed
-  // margin on top of it, covering sessions that arrive between one admission
-  // round and the next, before outbound has recomputed.
+  // The queue is already adaptive: admission reads capacity REMAINING, so
+  // other work lowers what the queue may take with no configuration at all.
+  // This is the fixed margin on top of that, covering arrivals between one
+  // admission round and the next, before the queue has recomputed.
   //
-  // Size it as arrivals per second times a few seconds, NOT as peak inbound
-  // concurrency. A project taking 5 inbound calls/sec wants roughly 10-20 here
-  // even if it runs 500 inbound calls at once.
-  uint32 outbound_headroom = 1;
+  // Size it as arrivals per second times a few seconds, NOT as the peak
+  // concurrency of that other work. A project starting 5 sessions/sec wants
+  // roughly 10-20 here even if it runs 500 at once.
+  uint32 min_free_capacity = 1;
 
   repeated DispatchLimit limits = 2;
 }
 
 message AddJobsRequest {
-  // Up to 1,000 per request; clients loop for larger campaigns.
+  // Up to 1,000 per request; clients loop to add more.
   repeated QueuedJobInput jobs = 1;
   // Attach every job in this request to a group, created on first use.
   optional string group_id = 2 [(logger.name) = "groupID"];
   // Jobs from this group to run at once. Applied when the group is created and
   // ignored on later adds to the same group. Unset uses the dispatcher
   // default. Group limits live here rather than in DispatchQueueConfig because
-  // groups are per-campaign and would otherwise churn the project config.
+  // groups are short-lived and would otherwise churn the project config.
   optional uint32 group_concurrency_limit = 3;
 }
 
@@ -260,6 +262,10 @@ message RetryJobsRequest {
   repeated string job_ids = 1 [(logger.name) = "jobIDs"];
   // Replaces expires_at on the retried jobs.
   optional google.protobuf.Timestamp expires_at = 2;
+  // Replaces start_after on the retried jobs, to hold a retry back rather than
+  // re-queueing it immediately. Unset clears any start_after the job carried,
+  // since the original hold has already elapsed.
+  optional google.protobuf.Timestamp start_after = 3;
 }
 
 message RetryJobsResponse {
