@@ -56,7 +56,7 @@ service AgentDispatchQueue {
 
 enum QueuedJobStatus {
   QUEUED_JOB_STATUS_UNSPECIFIED = 0;
-  // Awaiting capacity.
+  // Awaiting capacity, or waiting on not_before.
   QUEUED_JOB_STATUS_QUEUED = 1;
   // Admitted; CreateDispatch in flight.
   QUEUED_JOB_STATUS_DISPATCHING = 2;
@@ -66,7 +66,8 @@ enum QueuedJobStatus {
   QUEUED_JOB_STATUS_FAILED = 5;
   // Removed, or cancelled with its group, before it was admitted.
   QUEUED_JOB_STATUS_CANCELLED = 6;
-  // Still queued at expires_at; never dispatched.
+  // Still queued at expires_at; never dispatched. Includes a job whose
+  // not_before never arrived before it expired.
   QUEUED_JOB_STATUS_EXPIRED = 7;
 }
 
@@ -88,7 +89,8 @@ message QueuedJobInput {
   JobRestartPolicy restart_policy = 7;
 
   // Never dispatch after this time; the job goes to EXPIRED instead. Capped at
-  // 8 days out to stay inside the row retention window.
+  // 8 days out to stay inside the row retention window, which also bounds
+  // not_before.
   optional google.protobuf.Timestamp expires_at = 8;
   // Per-job callbacks, signed with the project key, as with Egress per-request
   // webhooks. Project-level webhooks fire regardless.
@@ -101,6 +103,12 @@ message QueuedJobInput {
   // right, a phone number is not. Identities make the label set grow with the
   // campaign and put PII in a configuration surface.
   map<string, string> labels = 10;
+
+  // Never dispatch before this time. A floor, not an appointment: the job
+  // still waits on capacity once eligible, and eligibility only filters the
+  // FIFO scan - order stays created_at, so a job held here keeps its original
+  // place in line. Must be before expires_at.
+  optional google.protobuf.Timestamp not_before = 11;
 }
 
 message QueuedJob {
