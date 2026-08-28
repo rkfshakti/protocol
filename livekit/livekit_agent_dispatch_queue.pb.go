@@ -520,13 +520,12 @@ type DispatchLimit struct {
 	// set means every distinct value gets its own budget of this size, so one
 	// rule can cover all agents without enumerating them.
 	Key string `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
-	// Jobs from this scope running at once. Unset is unlimited; 0 blocks the
-	// scope without touching its jobs.
-	MaxConcurrent *uint32 `protobuf:"varint,4,opt,name=max_concurrent,json=maxConcurrent,proto3,oneof" json:"max_concurrent,omitempty"`
-	// Dispatch starts allowed in any rolling 60 seconds - not calendar minutes.
-	// The scheduler releases this budget in slices across admission rounds, so a
-	// minute's worth never lands at once. Unset is unrated.
-	MaxStartsPerMinute *uint32 `protobuf:"varint,5,opt,name=max_starts_per_minute,json=maxStartsPerMinute,proto3,oneof" json:"max_starts_per_minute,omitempty"`
+	// Jobs from this scope running at once. Zero leaves the scope uncapped.
+	MaxConcurrent uint32 `protobuf:"varint,4,opt,name=max_concurrent,json=maxConcurrent,proto3" json:"max_concurrent,omitempty"`
+	// Dispatch starts allowed per second. The scheduler releases the budget in
+	// slices across admission rounds rather than at the top of each second. Zero
+	// leaves the scope unrated.
+	MaxStartsPerSecond uint32 `protobuf:"varint,5,opt,name=max_starts_per_second,json=maxStartsPerSecond,proto3" json:"max_starts_per_second,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -576,15 +575,15 @@ func (x *DispatchLimit) GetKey() string {
 }
 
 func (x *DispatchLimit) GetMaxConcurrent() uint32 {
-	if x != nil && x.MaxConcurrent != nil {
-		return *x.MaxConcurrent
+	if x != nil {
+		return x.MaxConcurrent
 	}
 	return 0
 }
 
-func (x *DispatchLimit) GetMaxStartsPerMinute() uint32 {
-	if x != nil && x.MaxStartsPerMinute != nil {
-		return *x.MaxStartsPerMinute
+func (x *DispatchLimit) GetMaxStartsPerSecond() uint32 {
+	if x != nil {
+		return x.MaxStartsPerSecond
 	}
 	return 0
 }
@@ -663,10 +662,10 @@ type AddJobsRequest struct {
 	// Attach every job in this request to a group, created on first use.
 	GroupId *string `protobuf:"bytes,2,opt,name=group_id,json=groupId,proto3,oneof" json:"group_id,omitempty"`
 	// Jobs from this group to run at once. Applied when the group is created and
-	// ignored on later adds to the same group. Unset uses the dispatcher
-	// default. Group limits live here rather than in DispatchQueueConfig because
+	// ignored on later adds to the same group. Zero means the dispatcher default
+	// applies. Group limits live here rather than in DispatchQueueConfig because
 	// groups are short-lived and would otherwise churn the project config.
-	GroupConcurrencyLimit *uint32 `protobuf:"varint,3,opt,name=group_concurrency_limit,json=groupConcurrencyLimit,proto3,oneof" json:"group_concurrency_limit,omitempty"`
+	GroupConcurrencyLimit uint32 `protobuf:"varint,3,opt,name=group_concurrency_limit,json=groupConcurrencyLimit,proto3" json:"group_concurrency_limit,omitempty"`
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }
@@ -716,8 +715,8 @@ func (x *AddJobsRequest) GetGroupId() string {
 }
 
 func (x *AddJobsRequest) GetGroupConcurrencyLimit() uint32 {
-	if x != nil && x.GroupConcurrencyLimit != nil {
-		return *x.GroupConcurrencyLimit
+	if x != nil {
+		return x.GroupConcurrencyLimit
 	}
 	return 0
 }
@@ -1858,24 +1857,21 @@ const file_livekit_agent_dispatch_queue_proto_rawDesc = "" +
 	"\x11concurrency_limit\x18\x05 \x01(\rR\x10concurrencyLimit\x1aU\n" +
 	"\vStatusCount\x120\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x18.livekit.QueuedJobStatusR\x06status\x12\x14\n" +
-	"\x05count\x18\x02 \x01(\rR\x05count\"\xe5\x01\n" +
+	"\x05count\x18\x02 \x01(\rR\x05count\"\xae\x01\n" +
 	"\rDispatchLimit\x121\n" +
 	"\x05scope\x18\x01 \x01(\x0e2\x1b.livekit.DispatchLimitScopeR\x05scope\x12\x10\n" +
-	"\x03key\x18\x02 \x01(\tR\x03key\x12*\n" +
-	"\x0emax_concurrent\x18\x04 \x01(\rH\x00R\rmaxConcurrent\x88\x01\x01\x126\n" +
-	"\x15max_starts_per_minute\x18\x05 \x01(\rH\x01R\x12maxStartsPerMinute\x88\x01\x01B\x11\n" +
-	"\x0f_max_concurrentB\x18\n" +
-	"\x16_max_starts_per_minute\"q\n" +
+	"\x03key\x18\x02 \x01(\tR\x03key\x12%\n" +
+	"\x0emax_concurrent\x18\x04 \x01(\rR\rmaxConcurrent\x121\n" +
+	"\x15max_starts_per_second\x18\x05 \x01(\rR\x12maxStartsPerSecond\"q\n" +
 	"\x13DispatchQueueConfig\x12*\n" +
 	"\x11min_free_capacity\x18\x01 \x01(\rR\x0fminFreeCapacity\x12.\n" +
-	"\x06limits\x18\x02 \x03(\v2\x16.livekit.DispatchLimitR\x06limits\"\xcf\x01\n" +
+	"\x06limits\x18\x02 \x03(\v2\x16.livekit.DispatchLimitR\x06limits\"\xae\x01\n" +
 	"\x0eAddJobsRequest\x12+\n" +
 	"\x04jobs\x18\x01 \x03(\v2\x17.livekit.QueuedJobInputR\x04jobs\x12*\n" +
 	"\bgroup_id\x18\x02 \x01(\tB\n" +
-	"\xbaP\agroupIDH\x00R\agroupId\x88\x01\x01\x12;\n" +
-	"\x17group_concurrency_limit\x18\x03 \x01(\rH\x01R\x15groupConcurrencyLimit\x88\x01\x01B\v\n" +
-	"\t_group_idB\x1a\n" +
-	"\x18_group_concurrency_limit\"9\n" +
+	"\xbaP\agroupIDH\x00R\agroupId\x88\x01\x01\x126\n" +
+	"\x17group_concurrency_limit\x18\x03 \x01(\rR\x15groupConcurrencyLimitB\v\n" +
+	"\t_group_id\"9\n" +
 	"\x0fAddJobsResponse\x12&\n" +
 	"\x04jobs\x18\x01 \x03(\v2\x12.livekit.QueuedJobR\x04jobs\"0\n" +
 	"\rGetJobRequest\x12\x1f\n" +
@@ -2089,7 +2085,6 @@ func file_livekit_agent_dispatch_queue_proto_init() {
 	file_livekit_models_proto_init()
 	file_livekit_agent_dispatch_queue_proto_msgTypes[0].OneofWrappers = []any{}
 	file_livekit_agent_dispatch_queue_proto_msgTypes[1].OneofWrappers = []any{}
-	file_livekit_agent_dispatch_queue_proto_msgTypes[3].OneofWrappers = []any{}
 	file_livekit_agent_dispatch_queue_proto_msgTypes[5].OneofWrappers = []any{}
 	file_livekit_agent_dispatch_queue_proto_msgTypes[9].OneofWrappers = []any{}
 	file_livekit_agent_dispatch_queue_proto_msgTypes[13].OneofWrappers = []any{}

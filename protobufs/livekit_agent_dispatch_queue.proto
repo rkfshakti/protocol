@@ -167,13 +167,12 @@ message DispatchLimit {
   // rule can cover all agents without enumerating them.
   string key = 2;
 
-  // Jobs from this scope running at once. Unset is unlimited; 0 blocks the
-  // scope without touching its jobs.
-  optional uint32 max_concurrent = 4;
-  // Dispatch starts allowed in any rolling 60 seconds - not calendar minutes.
-  // The scheduler releases this budget in slices across admission rounds, so a
-  // minute's worth never lands at once. Unset is unrated.
-  optional uint32 max_starts_per_minute = 5;
+  // Jobs from this scope running at once. Zero leaves the scope uncapped.
+  uint32 max_concurrent = 4;
+  // Dispatch starts allowed per second. The scheduler releases the budget in
+  // slices across admission rounds rather than at the top of each second. Zero
+  // leaves the scope unrated.
+  uint32 max_starts_per_second = 5;
 }
 
 message DispatchQueueConfig {
@@ -203,10 +202,10 @@ message AddJobsRequest {
   // Attach every job in this request to a group, created on first use.
   optional string group_id = 2 [(logger.name) = "groupID"];
   // Jobs from this group to run at once. Applied when the group is created and
-  // ignored on later adds to the same group. Unset uses the dispatcher
-  // default. Group limits live here rather than in DispatchQueueConfig because
+  // ignored on later adds to the same group. Zero means the dispatcher default
+  // applies. Group limits live here rather than in DispatchQueueConfig because
   // groups are short-lived and would otherwise churn the project config.
-  optional uint32 group_concurrency_limit = 3;
+  uint32 group_concurrency_limit = 3;
 }
 
 message AddJobsResponse {
