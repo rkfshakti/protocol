@@ -176,8 +176,10 @@ type QueuedJobInput struct {
 	// 8 days out to stay inside the row retention window, which also bounds
 	// start_after.
 	ExpiresAt *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=expires_at,json=expiresAt,proto3,oneof" json:"expires_at,omitempty"`
-	// Per-job callbacks, signed with the project key, as with Egress per-request
-	// webhooks. Project-level webhooks fire regardless.
+	// Callbacks for this job's terminal event, delivered in addition to any set
+	// on its group and on the project. Same pattern as Egress per-request
+	// webhooks. Reads clear signing_key, so a job read back carries its webhook
+	// URLs but not their keys.
 	Webhooks []*WebhookConfig `protobuf:"bytes,9,rep,name=webhooks,proto3" json:"webhooks,omitempty"`
 	// Hold the job until this time. A floor, not an appointment: the job still
 	// waits on capacity once eligible, and eligibility only filters the FIFO
@@ -437,8 +439,10 @@ type JobGroup struct {
 	// Jobs from this group running at once, as set when the group was created.
 	// Zero means the dispatcher default applies.
 	ConcurrencyLimit uint32 `protobuf:"varint,5,opt,name=concurrency_limit,json=concurrencyLimit,proto3" json:"concurrency_limit,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// As set when the group was created. signing_key is cleared here.
+	Webhooks      []*WebhookConfig `protobuf:"bytes,6,rep,name=webhooks,proto3" json:"webhooks,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *JobGroup) Reset() {
@@ -504,6 +508,13 @@ func (x *JobGroup) GetConcurrencyLimit() uint32 {
 		return x.ConcurrencyLimit
 	}
 	return 0
+}
+
+func (x *JobGroup) GetWebhooks() []*WebhookConfig {
+	if x != nil {
+		return x.Webhooks
+	}
+	return nil
 }
 
 // One limit over a slice of the project's queued traffic. A job is evaluated
@@ -677,8 +688,16 @@ type AddJobsRequest struct {
 	// applies. Group limits live here rather than in DispatchQueueConfig because
 	// groups are short-lived and would otherwise churn the project config.
 	GroupConcurrencyLimit uint32 `protobuf:"varint,3,opt,name=group_concurrency_limit,json=groupConcurrencyLimit,proto3" json:"group_concurrency_limit,omitempty"`
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	// Callbacks for the terminal event of every job in this group, so a caller
+	// adding a thousand jobs does not repeat the same URL on each. Applied when
+	// the group is created and ignored on later adds, as above.
+	//
+	// Project, group and job callbacks all fire. A URL listed at more than one
+	// level is delivered to once, using the most specific entry: job, then
+	// group, then project.
+	GroupWebhooks []*WebhookConfig `protobuf:"bytes,4,rep,name=group_webhooks,json=groupWebhooks,proto3" json:"group_webhooks,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *AddJobsRequest) Reset() {
@@ -730,6 +749,13 @@ func (x *AddJobsRequest) GetGroupConcurrencyLimit() uint32 {
 		return x.GroupConcurrencyLimit
 	}
 	return 0
+}
+
+func (x *AddJobsRequest) GetGroupWebhooks() []*WebhookConfig {
+	if x != nil {
+		return x.GroupWebhooks
+	}
+	return nil
 }
 
 type AddJobsResponse struct {
@@ -1857,7 +1883,7 @@ const file_livekit_agent_dispatch_queue_proto_rawDesc = "" +
 	" \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x12?\n" +
 	"\rdispatched_at\x18\v \x01(\v2\x1a.google.protobuf.TimestampR\fdispatchedAt\x12=\n" +
 	"\fcompleted_at\x18\f \x01(\v2\x1a.google.protobuf.TimestampR\vcompletedAtB\v\n" +
-	"\t_group_id\"\xb4\x02\n" +
+	"\t_group_id\"\xe8\x02\n" +
 	"\bJobGroup\x12\x1a\n" +
 	"\x02id\x18\x01 \x01(\tB\n" +
 	"\xbaP\agroupIDR\x02id\x12\x16\n" +
@@ -1865,7 +1891,8 @@ const file_livekit_agent_dispatch_queue_proto_rawDesc = "" +
 	"\n" +
 	"created_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x125\n" +
 	"\x06counts\x18\x04 \x03(\v2\x1d.livekit.JobGroup.StatusCountR\x06counts\x12+\n" +
-	"\x11concurrency_limit\x18\x05 \x01(\rR\x10concurrencyLimit\x1aU\n" +
+	"\x11concurrency_limit\x18\x05 \x01(\rR\x10concurrencyLimit\x122\n" +
+	"\bwebhooks\x18\x06 \x03(\v2\x16.livekit.WebhookConfigR\bwebhooks\x1aU\n" +
 	"\vStatusCount\x120\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x18.livekit.QueuedJobStatusR\x06status\x12\x14\n" +
 	"\x05count\x18\x02 \x01(\rR\x05count\"\xae\x01\n" +
@@ -1876,12 +1903,13 @@ const file_livekit_agent_dispatch_queue_proto_rawDesc = "" +
 	"\x15max_starts_per_second\x18\x05 \x01(\rR\x12maxStartsPerSecond\"q\n" +
 	"\x13DispatchQueueConfig\x12*\n" +
 	"\x11min_free_capacity\x18\x01 \x01(\rR\x0fminFreeCapacity\x12.\n" +
-	"\x06limits\x18\x02 \x03(\v2\x16.livekit.DispatchLimitR\x06limits\"\xae\x01\n" +
+	"\x06limits\x18\x02 \x03(\v2\x16.livekit.DispatchLimitR\x06limits\"\xed\x01\n" +
 	"\x0eAddJobsRequest\x12+\n" +
 	"\x04jobs\x18\x01 \x03(\v2\x17.livekit.QueuedJobInputR\x04jobs\x12*\n" +
 	"\bgroup_id\x18\x02 \x01(\tB\n" +
 	"\xbaP\agroupIDH\x00R\agroupId\x88\x01\x01\x126\n" +
-	"\x17group_concurrency_limit\x18\x03 \x01(\rR\x15groupConcurrencyLimitB\v\n" +
+	"\x17group_concurrency_limit\x18\x03 \x01(\rR\x15groupConcurrencyLimit\x12=\n" +
+	"\x0egroup_webhooks\x18\x04 \x03(\v2\x16.livekit.WebhookConfigR\rgroupWebhooksB\v\n" +
 	"\t_group_id\"9\n" +
 	"\x0fAddJobsResponse\x12&\n" +
 	"\x04jobs\x18\x01 \x03(\v2\x12.livekit.QueuedJobR\x04jobs\"0\n" +
@@ -2039,52 +2067,54 @@ var file_livekit_agent_dispatch_queue_proto_depIdxs = []int32{
 	34, // 9: livekit.QueuedJob.completed_at:type_name -> google.protobuf.Timestamp
 	34, // 10: livekit.JobGroup.created_at:type_name -> google.protobuf.Timestamp
 	32, // 11: livekit.JobGroup.counts:type_name -> livekit.JobGroup.StatusCount
-	1,  // 12: livekit.DispatchLimit.scope:type_name -> livekit.DispatchLimitScope
-	5,  // 13: livekit.DispatchQueueConfig.limits:type_name -> livekit.DispatchLimit
-	2,  // 14: livekit.AddJobsRequest.jobs:type_name -> livekit.QueuedJobInput
-	3,  // 15: livekit.AddJobsResponse.jobs:type_name -> livekit.QueuedJob
-	3,  // 16: livekit.GetJobResponse.job:type_name -> livekit.QueuedJob
-	0,  // 17: livekit.ListJobsRequest.status:type_name -> livekit.QueuedJobStatus
-	36, // 18: livekit.ListJobsRequest.page_token:type_name -> livekit.TokenPagination
-	3,  // 19: livekit.ListJobsResponse.jobs:type_name -> livekit.QueuedJob
-	36, // 20: livekit.ListJobsResponse.next_page_token:type_name -> livekit.TokenPagination
-	34, // 21: livekit.RetryJobsRequest.expires_at:type_name -> google.protobuf.Timestamp
-	34, // 22: livekit.RetryJobsRequest.start_after:type_name -> google.protobuf.Timestamp
-	3,  // 23: livekit.RetryJobsResponse.jobs:type_name -> livekit.QueuedJob
-	4,  // 24: livekit.ListJobGroupsResponse.groups:type_name -> livekit.JobGroup
-	6,  // 25: livekit.GetDispatchQueueConfigResponse.config:type_name -> livekit.DispatchQueueConfig
-	6,  // 26: livekit.UpdateDispatchQueueConfigRequest.config:type_name -> livekit.DispatchQueueConfig
-	6,  // 27: livekit.UpdateDispatchQueueConfigResponse.config:type_name -> livekit.DispatchQueueConfig
-	0,  // 28: livekit.JobGroup.StatusCount.status:type_name -> livekit.QueuedJobStatus
-	7,  // 29: livekit.AgentDispatchQueue.AddJobs:input_type -> livekit.AddJobsRequest
-	9,  // 30: livekit.AgentDispatchQueue.GetJob:input_type -> livekit.GetJobRequest
-	11, // 31: livekit.AgentDispatchQueue.ListJobs:input_type -> livekit.ListJobsRequest
-	13, // 32: livekit.AgentDispatchQueue.RemoveJob:input_type -> livekit.RemoveJobRequest
-	15, // 33: livekit.AgentDispatchQueue.RetryJobs:input_type -> livekit.RetryJobsRequest
-	17, // 34: livekit.AgentDispatchQueue.ListJobGroups:input_type -> livekit.ListJobGroupsRequest
-	19, // 35: livekit.AgentDispatchQueue.PauseJobGroup:input_type -> livekit.PauseJobGroupRequest
-	21, // 36: livekit.AgentDispatchQueue.ResumeJobGroup:input_type -> livekit.ResumeJobGroupRequest
-	23, // 37: livekit.AgentDispatchQueue.CancelJobGroup:input_type -> livekit.CancelJobGroupRequest
-	25, // 38: livekit.AgentDispatchQueue.DeleteJobGroup:input_type -> livekit.DeleteJobGroupRequest
-	27, // 39: livekit.AgentDispatchQueue.GetDispatchQueueConfig:input_type -> livekit.GetDispatchQueueConfigRequest
-	29, // 40: livekit.AgentDispatchQueue.UpdateDispatchQueueConfig:input_type -> livekit.UpdateDispatchQueueConfigRequest
-	8,  // 41: livekit.AgentDispatchQueue.AddJobs:output_type -> livekit.AddJobsResponse
-	10, // 42: livekit.AgentDispatchQueue.GetJob:output_type -> livekit.GetJobResponse
-	12, // 43: livekit.AgentDispatchQueue.ListJobs:output_type -> livekit.ListJobsResponse
-	14, // 44: livekit.AgentDispatchQueue.RemoveJob:output_type -> livekit.RemoveJobResponse
-	16, // 45: livekit.AgentDispatchQueue.RetryJobs:output_type -> livekit.RetryJobsResponse
-	18, // 46: livekit.AgentDispatchQueue.ListJobGroups:output_type -> livekit.ListJobGroupsResponse
-	20, // 47: livekit.AgentDispatchQueue.PauseJobGroup:output_type -> livekit.PauseJobGroupResponse
-	22, // 48: livekit.AgentDispatchQueue.ResumeJobGroup:output_type -> livekit.ResumeJobGroupResponse
-	24, // 49: livekit.AgentDispatchQueue.CancelJobGroup:output_type -> livekit.CancelJobGroupResponse
-	26, // 50: livekit.AgentDispatchQueue.DeleteJobGroup:output_type -> livekit.DeleteJobGroupResponse
-	28, // 51: livekit.AgentDispatchQueue.GetDispatchQueueConfig:output_type -> livekit.GetDispatchQueueConfigResponse
-	30, // 52: livekit.AgentDispatchQueue.UpdateDispatchQueueConfig:output_type -> livekit.UpdateDispatchQueueConfigResponse
-	41, // [41:53] is the sub-list for method output_type
-	29, // [29:41] is the sub-list for method input_type
-	29, // [29:29] is the sub-list for extension type_name
-	29, // [29:29] is the sub-list for extension extendee
-	0,  // [0:29] is the sub-list for field type_name
+	35, // 12: livekit.JobGroup.webhooks:type_name -> livekit.WebhookConfig
+	1,  // 13: livekit.DispatchLimit.scope:type_name -> livekit.DispatchLimitScope
+	5,  // 14: livekit.DispatchQueueConfig.limits:type_name -> livekit.DispatchLimit
+	2,  // 15: livekit.AddJobsRequest.jobs:type_name -> livekit.QueuedJobInput
+	35, // 16: livekit.AddJobsRequest.group_webhooks:type_name -> livekit.WebhookConfig
+	3,  // 17: livekit.AddJobsResponse.jobs:type_name -> livekit.QueuedJob
+	3,  // 18: livekit.GetJobResponse.job:type_name -> livekit.QueuedJob
+	0,  // 19: livekit.ListJobsRequest.status:type_name -> livekit.QueuedJobStatus
+	36, // 20: livekit.ListJobsRequest.page_token:type_name -> livekit.TokenPagination
+	3,  // 21: livekit.ListJobsResponse.jobs:type_name -> livekit.QueuedJob
+	36, // 22: livekit.ListJobsResponse.next_page_token:type_name -> livekit.TokenPagination
+	34, // 23: livekit.RetryJobsRequest.expires_at:type_name -> google.protobuf.Timestamp
+	34, // 24: livekit.RetryJobsRequest.start_after:type_name -> google.protobuf.Timestamp
+	3,  // 25: livekit.RetryJobsResponse.jobs:type_name -> livekit.QueuedJob
+	4,  // 26: livekit.ListJobGroupsResponse.groups:type_name -> livekit.JobGroup
+	6,  // 27: livekit.GetDispatchQueueConfigResponse.config:type_name -> livekit.DispatchQueueConfig
+	6,  // 28: livekit.UpdateDispatchQueueConfigRequest.config:type_name -> livekit.DispatchQueueConfig
+	6,  // 29: livekit.UpdateDispatchQueueConfigResponse.config:type_name -> livekit.DispatchQueueConfig
+	0,  // 30: livekit.JobGroup.StatusCount.status:type_name -> livekit.QueuedJobStatus
+	7,  // 31: livekit.AgentDispatchQueue.AddJobs:input_type -> livekit.AddJobsRequest
+	9,  // 32: livekit.AgentDispatchQueue.GetJob:input_type -> livekit.GetJobRequest
+	11, // 33: livekit.AgentDispatchQueue.ListJobs:input_type -> livekit.ListJobsRequest
+	13, // 34: livekit.AgentDispatchQueue.RemoveJob:input_type -> livekit.RemoveJobRequest
+	15, // 35: livekit.AgentDispatchQueue.RetryJobs:input_type -> livekit.RetryJobsRequest
+	17, // 36: livekit.AgentDispatchQueue.ListJobGroups:input_type -> livekit.ListJobGroupsRequest
+	19, // 37: livekit.AgentDispatchQueue.PauseJobGroup:input_type -> livekit.PauseJobGroupRequest
+	21, // 38: livekit.AgentDispatchQueue.ResumeJobGroup:input_type -> livekit.ResumeJobGroupRequest
+	23, // 39: livekit.AgentDispatchQueue.CancelJobGroup:input_type -> livekit.CancelJobGroupRequest
+	25, // 40: livekit.AgentDispatchQueue.DeleteJobGroup:input_type -> livekit.DeleteJobGroupRequest
+	27, // 41: livekit.AgentDispatchQueue.GetDispatchQueueConfig:input_type -> livekit.GetDispatchQueueConfigRequest
+	29, // 42: livekit.AgentDispatchQueue.UpdateDispatchQueueConfig:input_type -> livekit.UpdateDispatchQueueConfigRequest
+	8,  // 43: livekit.AgentDispatchQueue.AddJobs:output_type -> livekit.AddJobsResponse
+	10, // 44: livekit.AgentDispatchQueue.GetJob:output_type -> livekit.GetJobResponse
+	12, // 45: livekit.AgentDispatchQueue.ListJobs:output_type -> livekit.ListJobsResponse
+	14, // 46: livekit.AgentDispatchQueue.RemoveJob:output_type -> livekit.RemoveJobResponse
+	16, // 47: livekit.AgentDispatchQueue.RetryJobs:output_type -> livekit.RetryJobsResponse
+	18, // 48: livekit.AgentDispatchQueue.ListJobGroups:output_type -> livekit.ListJobGroupsResponse
+	20, // 49: livekit.AgentDispatchQueue.PauseJobGroup:output_type -> livekit.PauseJobGroupResponse
+	22, // 50: livekit.AgentDispatchQueue.ResumeJobGroup:output_type -> livekit.ResumeJobGroupResponse
+	24, // 51: livekit.AgentDispatchQueue.CancelJobGroup:output_type -> livekit.CancelJobGroupResponse
+	26, // 52: livekit.AgentDispatchQueue.DeleteJobGroup:output_type -> livekit.DeleteJobGroupResponse
+	28, // 53: livekit.AgentDispatchQueue.GetDispatchQueueConfig:output_type -> livekit.GetDispatchQueueConfigResponse
+	30, // 54: livekit.AgentDispatchQueue.UpdateDispatchQueueConfig:output_type -> livekit.UpdateDispatchQueueConfigResponse
+	43, // [43:55] is the sub-list for method output_type
+	31, // [31:43] is the sub-list for method input_type
+	31, // [31:31] is the sub-list for extension type_name
+	31, // [31:31] is the sub-list for extension extendee
+	0,  // [0:31] is the sub-list for field type_name
 }
 
 func init() { file_livekit_agent_dispatch_queue_proto_init() }
