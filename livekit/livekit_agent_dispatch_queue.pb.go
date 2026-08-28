@@ -525,6 +525,10 @@ type DispatchLimit struct {
 	// Dispatch starts allowed per second. The scheduler releases the budget in
 	// slices across admission rounds rather than at the top of each second. Zero
 	// leaves the scope unrated.
+	//
+	// This also spreads completions, since jobs that start together finish
+	// together. Capping it is usually cheaper than raising
+	// DispatchQueueConfig.min_free_capacity to cover the same burst.
 	MaxStartsPerSecond uint32 `protobuf:"varint,5,opt,name=max_starts_per_second,json=maxStartsPerSecond,proto3" json:"max_starts_per_second,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
@@ -597,14 +601,21 @@ type DispatchQueueConfig struct {
 	//
 	// The asymmetry is the point: a queued job that cannot get capacity waits,
 	// which is what the queue is for. A request from anywhere else has nowhere
-	// to wait - it fails with quota exceeded. So the queue must never take the
-	// project's last capacity, however much it still has to drain.
+	// to wait - it fails with quota exceeded.
 	//
-	// Size it to the demand you cannot afford to reject, NOT to the peak
-	// concurrency of that other work - admission already reads capacity
-	// REMAINING, so steady-state load lowers what the queue may take on its
-	// own. A project starting 5 sessions/sec wants roughly 10-20 here even if
-	// it runs 500 at once.
+	// Size it to how much that other work can GROW before capacity comes back,
+	// not to how much of it runs - admission reads capacity REMAINING, so a
+	// steady level of it already lowers what the queue takes. Capacity comes
+	// back only as jobs finish: a dispatched job is never cancelled or paused,
+	// so the queue cannot hand a slot back on demand.
+	//
+	// Job length and start spread therefore set the window this has to carry.
+	// Jobs that start together finish together, so a batch of hour-long jobs
+	// admitted at once frees nothing for an hour, and this floor has to absorb
+	// every arrival in between; thirty-second jobs free capacity continuously
+	// and need almost none. max_starts_per_second is the other half of this
+	// knob, and usually the cheaper one: spreading starts spreads completions
+	// and shortens the window, where raising it forces this floor up.
 	MinFreeCapacity uint32           `protobuf:"varint,1,opt,name=min_free_capacity,json=minFreeCapacity,proto3" json:"min_free_capacity,omitempty"`
 	Limits          []*DispatchLimit `protobuf:"bytes,2,rep,name=limits,proto3" json:"limits,omitempty"`
 	unknownFields   protoimpl.UnknownFields
