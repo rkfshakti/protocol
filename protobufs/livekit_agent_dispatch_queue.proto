@@ -172,6 +172,10 @@ message DispatchLimit {
   // Dispatch starts allowed per second. The scheduler releases the budget in
   // slices across admission rounds rather than at the top of each second. Zero
   // leaves the scope unrated.
+  //
+  // This also spreads completions, since jobs that start together finish
+  // together. Capping it is usually cheaper than raising
+  // DispatchQueueConfig.min_free_capacity to cover the same burst.
   uint32 max_starts_per_second = 5;
 }
 
@@ -183,14 +187,21 @@ message DispatchQueueConfig {
   //
   // The asymmetry is the point: a queued job that cannot get capacity waits,
   // which is what the queue is for. A request from anywhere else has nowhere
-  // to wait - it fails with quota exceeded. So the queue must never take the
-  // project's last capacity, however much it still has to drain.
+  // to wait - it fails with quota exceeded.
   //
-  // Size it to the demand you cannot afford to reject, NOT to the peak
-  // concurrency of that other work - admission already reads capacity
-  // REMAINING, so steady-state load lowers what the queue may take on its
-  // own. A project starting 5 sessions/sec wants roughly 10-20 here even if
-  // it runs 500 at once.
+  // Size it to how much that other work can GROW before capacity comes back,
+  // not to how much of it runs - admission reads capacity REMAINING, so a
+  // steady level of it already lowers what the queue takes. Capacity comes
+  // back only as jobs finish: a dispatched job is never cancelled or paused,
+  // so the queue cannot hand a slot back on demand.
+  //
+  // Job length and start spread therefore set the window this has to carry.
+  // Jobs that start together finish together, so a batch of hour-long jobs
+  // admitted at once frees nothing for an hour, and this floor has to absorb
+  // every arrival in between; thirty-second jobs free capacity continuously
+  // and need almost none. max_starts_per_second is the other half of this
+  // knob, and usually the cheaper one: spreading starts spreads completions
+  // and shortens the window, where raising it forces this floor up.
   uint32 min_free_capacity = 1;
 
   repeated DispatchLimit limits = 2;
