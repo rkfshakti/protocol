@@ -92,8 +92,10 @@ message QueuedJobInput {
   // 8 days out to stay inside the row retention window, which also bounds
   // start_after.
   optional google.protobuf.Timestamp expires_at = 8;
-  // Per-job callbacks, signed with the project key, as with Egress per-request
-  // webhooks. Project-level webhooks fire regardless.
+  // Callbacks for this job's terminal event, delivered in addition to any set
+  // on its group and on the project. Same pattern as Egress per-request
+  // webhooks. Reads clear signing_key, so a job read back carries its webhook
+  // URLs but not their keys.
   repeated WebhookConfig webhooks = 9;
 
   // Hold the job until this time. A floor, not an appointment: the job still
@@ -137,6 +139,8 @@ message JobGroup {
   // Jobs from this group running at once, as set when the group was created.
   // Zero means the dispatcher default applies.
   uint32 concurrency_limit = 5;
+  // As set when the group was created. signing_key is cleared here.
+  repeated WebhookConfig webhooks = 6;
 
   // Proto3 forbids enum map keys, so counts by status are a repeated pair.
   message StatusCount {
@@ -217,6 +221,14 @@ message AddJobsRequest {
   // applies. Group limits live here rather than in DispatchQueueConfig because
   // groups are short-lived and would otherwise churn the project config.
   uint32 group_concurrency_limit = 3;
+  // Callbacks for the terminal event of every job in this group, so a caller
+  // adding a thousand jobs does not repeat the same URL on each. Applied when
+  // the group is created and ignored on later adds, as above.
+  //
+  // Project, group and job callbacks all fire. A URL listed at more than one
+  // level is delivered to once, using the most specific entry: job, then
+  // group, then project.
+  repeated WebhookConfig group_webhooks = 4;
 }
 
 message AddJobsResponse {
